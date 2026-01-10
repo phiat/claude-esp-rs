@@ -48,7 +48,7 @@ claude
 | `-n`      | Start from newest (skip history, live only)   |
 | `-l`      | List recent sessions                          |
 | `-a`      | List active sessions (modified in last 5 min) |
-| `-v`      | Show version                                  |
+| `-V`      | Show version                                  |
 | `-h`      | Show help                                     |
 
 ### Examples
@@ -82,8 +82,7 @@ claude
 | `A`       | Toggle auto-discovery of new sessions     |
 | `tab`     | Switch focus between tree and stream      |
 | `j/k/↑/↓` | Navigate tree or scroll stream            |
-| `space`   | Toggle selected item in tree              |
-| `enter`   | Load background task output (when selected)|
+| `space/enter` | Toggle item, or load background task output |
 | `x/d`     | Remove selected session from tree         |
 | `g/G`     | Go to top/bottom of stream                |
 | `q`       | Quit                                      |
