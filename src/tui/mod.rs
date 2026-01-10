@@ -64,10 +64,7 @@ pub struct App {
 
 impl App {
     /// Create a new App
-    pub async fn new(
-        watcher: Arc<Watcher>,
-        channels: WatcherChannels,
-    ) -> Self {
+    pub async fn new(watcher: Arc<Watcher>, channels: WatcherChannels) -> Self {
         let mut tree = TreeView::new();
 
         // Add existing sessions to tree and cache session info
@@ -135,7 +132,10 @@ impl App {
         result
     }
 
-    async fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    async fn event_loop(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
         loop {
             // Draw UI
             terminal.draw(|f| self.render(f))?;
@@ -227,7 +227,8 @@ impl App {
                             self.load_background_task_output();
                         } else {
                             self.tree.toggle();
-                            self.stream.set_enabled_filters(self.tree.get_enabled_filters());
+                            self.stream
+                                .set_enabled_filters(self.tree.get_enabled_filters());
                         }
                     }
                 }
@@ -237,7 +238,8 @@ impl App {
                 self.stream.scroll_to_top();
             }
 
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
+            (KeyCode::Char('G'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                 self.stream.scroll_to_bottom();
                 // Enable auto-scroll when going to bottom (matches Go version)
                 if !self.stream.is_auto_scroll_enabled() {
@@ -254,7 +256,8 @@ impl App {
                             watcher.remove_session(&sid).await;
                         });
                         self.tree.remove_session(&session_id);
-                        self.stream.set_enabled_filters(self.tree.get_enabled_filters());
+                        self.stream
+                            .set_enabled_filters(self.tree.get_enabled_filters());
                         // Update cached session count
                         self.cached_sessions.count = self.cached_sessions.count.saturating_sub(1);
                         if self.cached_sessions.count != 1 {
@@ -264,7 +267,8 @@ impl App {
                 }
             }
 
-            (KeyCode::Char('A'), KeyModifiers::SHIFT) | (KeyCode::Char('A'), KeyModifiers::NONE) => {
+            (KeyCode::Char('A'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('A'), KeyModifiers::NONE) => {
                 self.watcher.toggle_auto_discovery();
             }
 
@@ -298,7 +302,10 @@ impl App {
                     agent_name: if node.parent_agent_id.is_empty() {
                         "Main".to_string()
                     } else {
-                        format!("Agent-{}", &node.parent_agent_id[..node.parent_agent_id.len().min(7)])
+                        format!(
+                            "Agent-{}",
+                            &node.parent_agent_id[..node.parent_agent_id.len().min(7)]
+                        )
                     },
                     timestamp: chrono::Utc::now(),
                     content,
@@ -324,13 +331,15 @@ impl App {
         // Poll new agent channel
         while let Ok(msg) = self.new_agent_rx.try_recv() {
             self.tree.add_agent(&msg.session_id, &msg.agent_id);
-            self.stream.set_enabled_filters(self.tree.get_enabled_filters());
+            self.stream
+                .set_enabled_filters(self.tree.get_enabled_filters());
         }
 
         // Poll new session channel
         while let Ok(msg) = self.new_session_rx.try_recv() {
             self.tree.add_session(&msg.session_id, &msg.project_path);
-            self.stream.set_enabled_filters(self.tree.get_enabled_filters());
+            self.stream
+                .set_enabled_filters(self.tree.get_enabled_filters());
             // Update cached session info
             self.cached_sessions.count += 1;
             if self.cached_sessions.count > 1 {
@@ -357,9 +366,13 @@ impl App {
     }
 
     async fn update_activity(&mut self) {
-        let activity = self.watcher.get_activity_info(Duration::from_secs(30)).await;
+        let activity = self
+            .watcher
+            .get_activity_info(Duration::from_secs(30))
+            .await;
         for info in activity {
-            self.tree.update_activity(&info.session_id, &info.agent_id, info.is_active);
+            self.tree
+                .update_activity(&info.session_id, &info.agent_id, info.is_active);
         }
     }
 
@@ -372,7 +385,8 @@ impl App {
 
         if self.show_tree {
             self.tree.set_size(self.tree_width, content_height);
-            self.stream.set_size(self.width - self.tree_width - 3, content_height);
+            self.stream
+                .set_size(self.width - self.tree_width - 3, content_height);
         } else {
             self.stream.set_size(self.width - 2, content_height);
         }
@@ -421,10 +435,14 @@ impl App {
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let thinking_toggle = self.render_toggle("Thinking", self.stream.is_thinking_enabled(), "t");
-        let tool_input_toggle = self.render_toggle("Tools", self.stream.is_tool_input_enabled(), "i");
-        let tool_output_toggle = self.render_toggle("Output", self.stream.is_tool_output_enabled(), "o");
-        let auto_scroll_toggle = self.render_toggle("Auto", self.stream.is_auto_scroll_enabled(), "a");
+        let thinking_toggle =
+            self.render_toggle("Thinking", self.stream.is_thinking_enabled(), "t");
+        let tool_input_toggle =
+            self.render_toggle("Tools", self.stream.is_tool_input_enabled(), "i");
+        let tool_output_toggle =
+            self.render_toggle("Output", self.stream.is_tool_output_enabled(), "o");
+        let auto_scroll_toggle =
+            self.render_toggle("Auto", self.stream.is_auto_scroll_enabled(), "a");
         let tree_toggle = self.render_toggle("Tree", self.show_tree, "h");
 
         // Session info from cache

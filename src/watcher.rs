@@ -303,10 +303,7 @@ impl Watcher {
 
     /// Build a Session from a main file path
     fn build_session(&self, main_file: &Path) -> Result<Session> {
-        let basename = main_file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let basename = main_file.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let id = basename.trim_end_matches(".jsonl").to_string();
 
         // Extract project path from parent directory name
@@ -510,12 +507,10 @@ impl Watcher {
                         .await
                         .insert(id.clone(), Arc::new(session));
 
-                    let _ = self
-                        .new_session_tx
-                        .try_send(NewSessionMsg {
-                            session_id: id,
-                            project_path,
-                        });
+                    let _ = self.new_session_tx.try_send(NewSessionMsg {
+                        session_id: id,
+                        project_path,
+                    });
                 }
             }
         }
@@ -583,20 +578,14 @@ impl Watcher {
 
                 let tool_id = name.trim_end_matches(".txt").to_string();
 
-                let exists = session
-                    .background_tasks
-                    .read()
-                    .await
-                    .contains_key(&tool_id);
+                let exists = session.background_tasks.read().await.contains_key(&tool_id);
                 if exists {
                     continue;
                 }
 
                 let (parent_agent_id, tool_name) =
                     self.find_background_task_parent(session, &tool_id).await;
-                let is_complete = self
-                    .is_background_task_complete(session, &tool_id)
-                    .await;
+                let is_complete = self.is_background_task_complete(session, &tool_id).await;
 
                 let task = BackgroundTask {
                     tool_id: tool_id.clone(),
@@ -715,10 +704,7 @@ impl Watcher {
 
     /// Extract a JSON field value
     fn extract_field(line: &str, field: &str) -> Option<String> {
-        for pattern in &[
-            format!("\"{}\":\"", field),
-            format!("\"{}\": \"", field),
-        ] {
+        for pattern in &[format!("\"{}\":\"", field), format!("\"{}\": \"", field)] {
             if let Some(idx) = line.find(pattern.as_str()) {
                 let start = idx + pattern.len();
                 let bytes = line.as_bytes();

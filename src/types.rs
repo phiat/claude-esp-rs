@@ -32,7 +32,6 @@ pub struct StreamItem {
     pub tool_id: Option<String>,
 }
 
-
 /// A background task launched by an agent
 #[derive(Debug, Clone)]
 pub struct BackgroundTask {

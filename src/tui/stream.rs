@@ -127,7 +127,10 @@ impl StreamView {
     /// Scroll down
     pub fn scroll_down(&mut self, lines: usize) {
         self.ensure_rendered();
-        let max_offset = self.rendered_lines.len().saturating_sub(self.height as usize);
+        let max_offset = self
+            .rendered_lines
+            .len()
+            .saturating_sub(self.height as usize);
         self.scroll_offset = (self.scroll_offset + lines).min(max_offset);
     }
 
@@ -140,7 +143,10 @@ impl StreamView {
     /// Scroll to bottom and enable auto-scroll
     pub fn scroll_to_bottom(&mut self) {
         self.ensure_rendered();
-        let max_offset = self.rendered_lines.len().saturating_sub(self.height as usize);
+        let max_offset = self
+            .rendered_lines
+            .len()
+            .saturating_sub(self.height as usize);
         self.scroll_offset = max_offset;
         self.auto_scroll = true;
     }
@@ -164,9 +170,9 @@ impl StreamView {
 
     /// Check if an item passes the filters
     fn is_item_enabled(&self, item: &StreamItem) -> bool {
-        self.enabled_filters.iter().any(|f| {
-            f.session_id == item.session_id && f.agent_id == item.agent_id
-        })
+        self.enabled_filters
+            .iter()
+            .any(|f| f.session_id == item.session_id && f.agent_id == item.agent_id)
     }
 
     /// Ensure lines are rendered
@@ -207,7 +213,10 @@ impl StreamView {
 
         // Auto-scroll to bottom if enabled
         if self.auto_scroll {
-            let max_offset = self.rendered_lines.len().saturating_sub(self.height as usize);
+            let max_offset = self
+                .rendered_lines
+                .len()
+                .saturating_sub(self.height as usize);
             self.scroll_offset = max_offset;
         }
     }
@@ -276,7 +285,10 @@ impl StreamView {
 
         // Truncate number of lines
         let (lines, truncated_count) = if lines.len() > MAX_LINES_PER_ITEM {
-            (&lines[..MAX_LINES_PER_ITEM], lines.len() - MAX_LINES_PER_ITEM)
+            (
+                &lines[..MAX_LINES_PER_ITEM],
+                lines.len() - MAX_LINES_PER_ITEM,
+            )
         } else {
             (&lines[..], 0)
         };

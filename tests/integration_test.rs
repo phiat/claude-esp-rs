@@ -37,7 +37,8 @@ fn test_real_jsonl_parsing() {
     }
 
     // Find a larger file for more thorough testing
-    let jsonl_path = files.iter()
+    let jsonl_path = files
+        .iter()
         .max_by_key(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
         .unwrap();
 

@@ -91,12 +91,7 @@ impl TreeView {
     /// Add a session to the tree
     pub fn add_session(&mut self, session_id: &str, project_path: &str) {
         // Check if session already exists
-        if self
-            .root
-            .children
-            .iter()
-            .any(|c| c.id == session_id)
-        {
+        if self.root.children.iter().any(|c| c.id == session_id) {
             return;
         }
 
@@ -389,7 +384,10 @@ impl TreeView {
         });
 
         // Get children count without holding a reference
-        let children_len = self.get_node_by_path(&path).map(|n| n.children.len()).unwrap_or(0);
+        let children_len = self
+            .get_node_by_path(&path)
+            .map(|n| n.children.len())
+            .unwrap_or(0);
 
         for i in 0..children_len {
             let mut child_path = path.clone();
