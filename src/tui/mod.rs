@@ -239,6 +239,10 @@ impl App {
 
             (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                 self.stream.scroll_to_bottom();
+                // Enable auto-scroll when going to bottom (matches Go version)
+                if !self.stream.is_auto_scroll_enabled() {
+                    self.stream.toggle_auto_scroll();
+                }
             }
 
             (KeyCode::Char('x'), KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE) => {

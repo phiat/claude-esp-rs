@@ -721,10 +721,11 @@ impl Watcher {
         ] {
             if let Some(idx) = line.find(pattern.as_str()) {
                 let start = idx + pattern.len();
+                let bytes = line.as_bytes();
                 let mut end = start;
-                while end < line.len() {
-                    let c = line.chars().nth(end)?;
-                    if c == '"' && (end == start || line.chars().nth(end - 1) != Some('\\')) {
+                // Use byte indexing for O(n) instead of O(n²) char iteration
+                while end < bytes.len() {
+                    if bytes[end] == b'"' && (end == start || bytes[end - 1] != b'\\') {
                         break;
                     }
                     end += 1;

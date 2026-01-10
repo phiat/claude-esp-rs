@@ -2,6 +2,8 @@
 
 Stream Claude Code's hidden output (thinking, tool calls, subagents) to a separate terminal in real-time.
 
+![claude-esp screenshot](docs/screenshot.png)
+
 > **Note:** This is a Rust port of the [Go version](https://github.com/phiat/claude-esp).
 
 ## The Problem
