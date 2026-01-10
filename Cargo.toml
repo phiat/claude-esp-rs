@@ -1,0 +1,28 @@
+[package]
+name = "claude-esp"
+version = "0.1.0"
+edition = "2021"
+description = "Stream Claude Code's hidden output to a separate terminal"
+license = "MIT"
+authors = ["phiat"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+tokio-util = "0.7"
+
+[[bin]]
+name = "claude-esp"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
