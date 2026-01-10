@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -17,6 +19,7 @@ pub const MAX_LINES_PER_ITEM: usize = 50;
 /// Stream view widget for displaying items
 pub struct StreamView {
     items: Vec<StreamItem>,
+    seen_tool_ids: HashSet<String>, // dedupe tool input/output by tool_id
     scroll_offset: usize,
     auto_scroll: bool,
     width: u16,
@@ -40,6 +43,7 @@ impl StreamView {
     pub fn new() -> Self {
         Self {
             items: Vec::new(),
+            seen_tool_ids: HashSet::new(),
             scroll_offset: 0,
             auto_scroll: true,
             width: 80,
@@ -65,6 +69,16 @@ impl StreamView {
 
     /// Add an item to the stream
     pub fn add_item(&mut self, item: StreamItem) {
+        // Deduplicate tool input/output by tool_id
+        if let Some(ref tool_id) = item.tool_id {
+            if !tool_id.is_empty() {
+                if self.seen_tool_ids.contains(tool_id) {
+                    return; // Skip duplicate
+                }
+                self.seen_tool_ids.insert(tool_id.clone());
+            }
+        }
+
         self.items.push(item);
 
         // Keep last MAX_STREAM_ITEMS
