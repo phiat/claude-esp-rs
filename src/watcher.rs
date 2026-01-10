@@ -53,6 +53,42 @@ fn get_claude_projects_dir() -> Result<PathBuf> {
     Ok(home.join(".claude").join("projects"))
 }
 
+/// Resolve the actual project path from an encoded directory name.
+/// The encoded name like "-home-phiat-lab-project-name" needs to be
+/// converted back to a real path, but we can't just replace all dashes
+/// because directory names can contain dashes (e.g., "claude-esp-rs").
+/// We try progressively from right to left to find existing paths.
+fn resolve_project_path(encoded: &str) -> String {
+    let encoded = encoded.trim_start_matches('-');
+    if encoded.is_empty() {
+        return String::new();
+    }
+
+    // Try to find the real path by testing which combination exists
+    let parts: Vec<&str> = encoded.split('-').collect();
+    if parts.is_empty() {
+        return encoded.to_string();
+    }
+
+    // Start from the full path converted naively
+    let naive_path = encoded.replace('-', "/");
+
+    // Try progressively joining segments from the right with dashes
+    // to find the actual directory name
+    for join_from in (1..parts.len()).rev() {
+        let path_part = parts[..join_from].join("/");
+        let dir_part = parts[join_from..].join("-");
+        let test_path = format!("/{}/{}", path_part, dir_part);
+
+        if Path::new(&test_path).exists() {
+            return format!("{}/{}", path_part, dir_part);
+        }
+    }
+
+    // Fallback to naive conversion
+    naive_path
+}
+
 /// Check if a path is a main session file (not a subagent, not a directory)
 fn is_main_session_file(path: &Path) -> bool {
     if !path.is_file() {
@@ -279,7 +315,7 @@ impl Watcher {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let project_path = project_dir.replace('-', "/").trim_start_matches('/').to_string();
+        let project_path = resolve_project_path(project_dir);
 
         // Find subagent files first (before creating Session)
         let mut subagents_map = HashMap::new();
@@ -969,7 +1005,7 @@ fn list_sessions_filtered(limit: usize, active_within: Duration) -> Result<Vec<S
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let project_path = project_dir.replace('-', "/").trim_start_matches('/').to_string();
+        let project_path = resolve_project_path(project_dir);
 
         let is_active = now
             .duration_since(modified)
