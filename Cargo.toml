@@ -20,7 +20,7 @@ dirs = "5"
 tokio-util = "0.7"
 
 [[bin]]
-name = "claude-esp"
+name = "claude-esp-rs"
 path = "src/main.rs"
 
 [profile.release]

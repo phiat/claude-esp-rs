@@ -17,16 +17,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: claude-esp-linux-amd64
+            artifact: claude-esp-rs-linux-amd64
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: claude-esp-darwin-amd64
+            artifact: claude-esp-rs-darwin-amd64
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: claude-esp-darwin-arm64
+            artifact: claude-esp-rs-darwin-arm64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: claude-esp-windows-amd64.exe
+            artifact: claude-esp-rs-windows-amd64.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -42,12 +42,12 @@ jobs:
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
         run: |
-          cp target/${{ matrix.target }}/release/claude-esp ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/claude-esp-rs ${{ matrix.artifact }}
 
       - name: Rename binary (Windows)
         if: runner.os == 'Windows'
         run: |
-          cp target/${{ matrix.target }}/release/claude-esp.exe ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/claude-esp-rs.exe ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

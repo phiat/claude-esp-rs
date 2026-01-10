@@ -1,10 +1,10 @@
-# claude-esp
+# claude-esp-rs
 
 Stream Claude Code's hidden output (thinking, tool calls, subagents) to a separate terminal in real-time.
 
-![claude-esp screenshot](docs/screenshot.png)
+![claude-esp-rs screenshot](docs/screenshot.png)
 
-> **Note:** This is a Rust port of the [Go version](https://github.com/phiat/claude-esp).
+> **Note:** This is a Rust port of the [Go version](https://github.com/phiat/claude-esp). The binary is named `claude-esp-rs` to allow running both versions side-by-side.
 
 ## The Problem
 
@@ -29,7 +29,7 @@ cd claude-esp-rs
 cargo build --release
 
 # Optional: install to PATH
-cp target/release/claude-esp ~/.local/bin/
+cp target/release/claude-esp-rs ~/.local/bin/
 ```
 
 ## Usage
@@ -39,7 +39,7 @@ cp target/release/claude-esp ~/.local/bin/
 claude
 
 # In a second terminal/tmux pane: run the watcher
-./target/release/claude-esp
+./target/release/claude-esp-rs
 ```
 
 ### Options
@@ -57,19 +57,19 @@ claude
 
 ```bash
 # Watch all active sessions
-./claude-esp
+claude-esp-rs
 
 # Skip history, only show new output
-./claude-esp -n
+claude-esp-rs -n
 
 # List active sessions
-./claude-esp -a
+claude-esp-rs -a
 
 # Watch a specific session
-./claude-esp -s 0b773376
+claude-esp-rs -s 0b773376
 
 # List recent sessions
-./claude-esp -l
+claude-esp-rs -l
 ```
 
 ## Keybindings
@@ -125,7 +125,7 @@ Recommended tmux layout:
 # Create a new tmux session with two panes
 tmux new-session -s claude \; \
   split-window -h \; \
-  send-keys 'claude-esp' C-m \; \
+  send-keys 'claude-esp-rs' C-m \; \
   select-pane -L \; \
   send-keys 'claude' C-m
 ```
@@ -136,7 +136,7 @@ Or add to your `.tmux.conf`:
 bind-key C-c new-window -n claude \; \
   send-keys 'claude' C-m \; \
   split-window -h \; \
-  send-keys 'claude-esp' C-m \; \
+  send-keys 'claude-esp-rs' C-m \; \
   select-pane -L
 ```
 
