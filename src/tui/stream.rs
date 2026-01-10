@@ -264,14 +264,11 @@ impl StreamView {
                 .push(Line::from(Span::styled(line.to_string(), content_style)));
         }
 
-        // Separator
+        // Separator (no extra blank line - matches Go version)
         let sep_width = width.min(60);
         let separator = "─".repeat(sep_width);
         self.rendered_lines
             .push(Line::from(Span::styled(separator, separator_style())));
-
-        // Empty line for spacing
-        self.rendered_lines.push(Line::from(""));
     }
 
     fn truncate_content(&self, content: &str, width: usize) -> String {
