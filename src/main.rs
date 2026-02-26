@@ -6,7 +6,7 @@ use std::time::Duration;
 use claude_esp::tui::App;
 use claude_esp::watcher::{list_active_sessions, list_sessions, Watcher};
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(
@@ -30,6 +30,10 @@ struct Cli {
     /// Start from newest (skip history, live only)
     #[arg(short = 'n')]
     skip_history: bool,
+
+    /// Poll interval in milliseconds (min 100)
+    #[arg(short = 'p', default_value = "500")]
+    poll_ms: u64,
 }
 
 #[tokio::main]
@@ -44,8 +48,11 @@ async fn main() -> Result<()> {
         return list_sessions_cmd();
     }
 
+    // Validate poll interval
+    let poll_ms = cli.poll_ms.max(100);
+
     // Run TUI
-    run_tui(cli.session.as_deref(), cli.skip_history).await
+    run_tui(cli.session.as_deref(), cli.skip_history, poll_ms).await
 }
 
 fn list_active_sessions_cmd() -> Result<()> {
@@ -87,8 +94,8 @@ fn list_sessions_cmd() -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(session_id: Option<&str>, skip_history: bool) -> Result<()> {
-    let (watcher, channels) = Watcher::new(session_id).await?;
+async fn run_tui(session_id: Option<&str>, skip_history: bool, poll_ms: u64) -> Result<()> {
+    let (watcher, channels) = Watcher::new(session_id, poll_ms).await?;
 
     if skip_history {
         watcher.set_skip_history(true);

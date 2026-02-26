@@ -47,8 +47,14 @@ pub const ITEM_CHANNEL_BUFFER: usize = 100;
 /// Channel buffer size for events
 pub const EVENT_CHANNEL_BUFFER: usize = 10;
 
-/// Get the Claude projects directory
+/// Get the Claude projects directory.
+/// Checks the CLAUDE_HOME environment variable first, falling back to ~/.claude.
 fn get_claude_projects_dir() -> Result<PathBuf> {
+    if let Ok(claude_home) = std::env::var("CLAUDE_HOME") {
+        if !claude_home.is_empty() {
+            return Ok(PathBuf::from(claude_home).join("projects"));
+        }
+    }
     let home = dirs::home_dir().context("Failed to get home directory")?;
     Ok(home.join(".claude").join("projects"))
 }
@@ -121,6 +127,7 @@ pub struct WatcherChannels {
 /// File watcher for Claude session files
 pub struct Watcher {
     claude_dir: PathBuf,
+    poll_interval_ms: u64,
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
     file_positions: Arc<RwLock<HashMap<PathBuf, u64>>>,
     item_tx: mpsc::Sender<StreamItem>,
@@ -135,8 +142,9 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Create a new watcher, optionally for a specific session
-    pub async fn new(session_id: Option<&str>) -> Result<(Self, WatcherChannels)> {
+    /// Create a new watcher, optionally for a specific session.
+    /// poll_ms sets the poll interval in milliseconds (0 uses default).
+    pub async fn new(session_id: Option<&str>, poll_ms: u64) -> Result<(Self, WatcherChannels)> {
         let claude_dir = get_claude_projects_dir()?;
 
         let (item_tx, item_rx) = mpsc::channel(ITEM_CHANNEL_BUFFER);
@@ -148,8 +156,15 @@ impl Watcher {
         let watch_active = Arc::new(AtomicBool::new(session_id.is_none()));
         let skip_history = Arc::new(AtomicBool::new(false));
 
+        let poll_interval_ms = if poll_ms == 0 {
+            POLL_INTERVAL_MS
+        } else {
+            poll_ms
+        };
+
         let watcher = Self {
             claude_dir,
+            poll_interval_ms,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             file_positions: Arc::new(RwLock::new(HashMap::new())),
             item_tx,
@@ -409,7 +424,7 @@ impl Watcher {
 
     /// Main watch loop
     async fn watch_loop(&self) {
-        let mut poll_interval = interval(Duration::from_millis(POLL_INTERVAL_MS));
+        let mut poll_interval = interval(Duration::from_millis(self.poll_interval_ms));
         let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
 
         // Initialize reading

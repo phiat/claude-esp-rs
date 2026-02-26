@@ -20,10 +20,17 @@ When using Claude Code interactively, tool outputs and thinking are collapsed by
 - **Filtering** - Toggle visibility of thinking, tools, outputs per session/agent
 - **Auto-scroll** - Follows new output, or scroll freely through history
 
+## Requirements
+
+- Rust 1.70 or later
+
 ## Installation
 
 ```bash
-# Clone and build
+# Install from crates.io (when published)
+cargo install claude-esp
+
+# Or clone and build from source
 git clone https://github.com/phiat/claude-esp-rs.git
 cd claude-esp-rs
 cargo build --release
@@ -32,6 +39,10 @@ cargo build --release
 cp target/release/claude-esp-rs ~/.local/bin/
 ```
 
+### Pre-built binaries
+
+Download pre-built binaries from the [Releases](https://github.com/phiat/claude-esp-rs/releases) page. Available for Linux (amd64, arm64), macOS (amd64, arm64), and Windows (amd64).
+
 ## Usage
 
 ```bash
@@ -39,19 +50,26 @@ cp target/release/claude-esp-rs ~/.local/bin/
 claude
 
 # In a second terminal/tmux pane: run the watcher
-./target/release/claude-esp-rs
+claude-esp-rs
 ```
 
 ### Options
 
-| Option    | Description                                   |
-| --------- | --------------------------------------------- |
-| `-s <ID>` | Watch a specific session by ID                |
-| `-n`      | Start from newest (skip history, live only)   |
-| `-l`      | List recent sessions                          |
-| `-a`      | List active sessions (modified in last 5 min) |
-| `-V`      | Show version                                  |
-| `-h`      | Show help                                     |
+| Option     | Description                                   |
+| ---------- | --------------------------------------------- |
+| `-s <ID>`  | Watch a specific session by ID                |
+| `-n`       | Start from newest (skip history, live only)   |
+| `-l`       | List recent sessions                          |
+| `-a`       | List active sessions (modified in last 5 min) |
+| `-p <ms>`  | Poll interval in milliseconds (default 500)   |
+| `-V`       | Show version                                  |
+| `-h`       | Show help                                     |
+
+### Environment Variables
+
+| Variable      | Description                                         |
+| ------------- | --------------------------------------------------- |
+| `CLAUDE_HOME` | Override Claude config directory (default: `~/.claude`) |
 
 ### Examples
 
@@ -67,6 +85,9 @@ claude-esp-rs -a
 
 # Watch a specific session
 claude-esp-rs -s 0b773376
+
+# Faster poll interval (200ms)
+claude-esp-rs -p 200
 
 # List recent sessions
 claude-esp-rs -l
@@ -165,6 +186,20 @@ claude-esp-rs/
 ## Development
 
 Built with [Ratatui](https://github.com/ratatui/ratatui) and [Tokio](https://tokio.rs/). Issue tracking was done with [beads](https://github.com/steveyegge/beads).
+
+```bash
+# Run tests
+cargo test
+
+# Build release
+cargo build --release
+
+# Check formatting
+cargo fmt --check
+
+# Lint
+cargo clippy
+```
 
 ## License
 
