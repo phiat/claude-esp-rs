@@ -1,5 +1,7 @@
 # claude-esp-rs
 
+[![Crates.io](https://img.shields.io/crates/v/claude-esp)](https://crates.io/crates/claude-esp)
+
 Stream Claude Code's hidden output (thinking, tool calls, subagents) to a separate terminal in real-time.
 
 ![claude-esp-rs screenshot](docs/screenshot.png)
@@ -22,12 +24,12 @@ When using Claude Code interactively, tool outputs and thinking are collapsed by
 
 ## Requirements
 
-- Rust 1.70 or later
+- Rust 1.74 or later
 
 ## Installation
 
 ```bash
-# Install from crates.io (when published)
+# Install from crates.io
 cargo install claude-esp
 
 # Or clone and build from source
@@ -108,7 +110,7 @@ claude-esp-rs -l
 | `space/enter` | Toggle item, or load background task output |
 | `x/d`     | Remove selected session from tree         |
 | `g/G`     | Go to top/bottom of stream                |
-| `q`       | Quit                                      |
+| `q/Ctrl+c`| Quit                                      |
 
 ## How It Works
 
