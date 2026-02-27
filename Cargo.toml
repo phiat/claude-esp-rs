@@ -1,10 +1,16 @@
 [package]
 name = "claude-esp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Stream Claude Code's hidden output to a separate terminal"
 license = "MIT"
 authors = ["phiat"]
+repository = "https://github.com/phiat/claude-esp-rs"
+homepage = "https://github.com/phiat/claude-esp-rs"
+readme = "README.md"
+keywords = ["claude", "tui", "terminal", "ai", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".beads/", ".github/", "AGENTS.md", "docs/"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
