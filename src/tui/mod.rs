@@ -452,7 +452,9 @@ impl App {
             ""
         };
 
-        let session_info = if let Some(ref id) = self.cached_sessions.single_session_id {
+        let session_info = if self.cached_sessions.count == 0 {
+            "Waiting...".to_string()
+        } else if let Some(ref id) = self.cached_sessions.single_session_id {
             format!("Session: {}{}", truncate(id, 12), auto_disc)
         } else {
             format!("{} sessions{}", self.cached_sessions.count, auto_disc)

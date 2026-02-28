@@ -225,13 +225,20 @@ impl Watcher {
             debounce_rx: Some(Arc::new(Mutex::new(debounce_rx))),
         };
 
-        // Initialize sessions
+        // Initialize sessions (graceful — never bail if nothing found)
         if let Some(sid) = session_id {
-            let session = watcher.find_session(sid)?;
-            let mut sessions = watcher.sessions.write().await;
-            sessions.insert(session.id.clone(), Arc::new(session));
+            match watcher.find_session(sid) {
+                Ok(session) => {
+                    let mut sessions = watcher.sessions.write().await;
+                    sessions.insert(session.id.clone(), Arc::new(session));
+                }
+                Err(_) => {
+                    // Session not found yet — watch loops will discover it
+                }
+            }
         } else {
-            watcher.discover_active_sessions().await?;
+            // Ignore errors — dir may not exist yet
+            let _ = watcher.discover_active_sessions().await;
         }
 
         let channels = WatcherChannels {
@@ -508,7 +515,13 @@ impl Watcher {
         let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
 
         // Set up directory watches for discovery
-        self.add_directory_watches(&self.claude_dir.clone()).await;
+        let claude_dir = self.claude_dir.clone();
+        if claude_dir.exists() {
+            self.add_directory_watches(&claude_dir).await;
+        } else {
+            // Watch closest existing ancestor so we detect when claude_dir is created
+            self.watch_ancestor_directory(&claude_dir).await;
+        }
 
         // Register file watches for all known sessions
         let sessions: Vec<Arc<Session>> = self.sessions.read().await.values().cloned().collect();
@@ -554,6 +567,20 @@ impl Watcher {
                     self.cleanup_file_positions().await;
                 }
             }
+        }
+    }
+
+    /// Watch the closest existing ancestor of a path, so we detect when it's created
+    async fn watch_ancestor_directory(&self, target: &Path) {
+        let mut ancestor = target.to_path_buf();
+        while !ancestor.exists() {
+            if !ancestor.pop() {
+                return;
+            }
+        }
+        if let Some(ref nw) = self.notify_watcher {
+            let mut watcher = nw.lock().await;
+            let _ = watcher.watch(&ancestor, RecursiveMode::NonRecursive);
         }
     }
 
@@ -606,6 +633,15 @@ impl Watcher {
 
     /// Handle file/directory creation
     async fn handle_fs_create(&self, path: &Path) {
+        // If claude_dir (or an ancestor leading to it) was just created,
+        // switch from ancestor-watching to full recursive watch
+        if (path.is_dir() && self.claude_dir.starts_with(path) || *path == self.claude_dir)
+            && self.claude_dir.exists()
+        {
+            self.add_directory_watches(&self.claude_dir.clone()).await;
+            let _ = self.discover_active_sessions().await;
+        }
+
         let path_str = path.to_string_lossy();
 
         // New .jsonl file — session or subagent

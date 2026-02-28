@@ -415,7 +415,10 @@ impl TreeView {
     /// Render the tree to lines
     pub fn render_lines(&self) -> Vec<Line<'static>> {
         if self.flat_nodes.is_empty() {
-            return vec![Line::from(Span::styled("No sessions", muted_style()))];
+            return vec![Line::from(Span::styled(
+                "Waiting for Claude Code sessions...",
+                muted_style(),
+            ))];
         }
 
         let mut lines = Vec::new();
