@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +47,9 @@ pub const ITEM_CHANNEL_BUFFER: usize = 100;
 
 /// Channel buffer size for events
 pub const EVENT_CHANNEL_BUFFER: usize = 10;
+
+/// Debounce interval for coalescing filesystem write events (ms)
+pub const DEBOUNCE_INTERVAL_MS: u64 = 50;
 
 /// Get the Claude projects directory.
 /// Checks the CLAUDE_HOME environment variable first, falling back to ~/.claude.
@@ -124,6 +128,13 @@ pub struct WatcherChannels {
     pub errors: mpsc::Receiver<anyhow::Error>,
 }
 
+/// Maps a watched file path to its session/agent context
+#[derive(Clone)]
+struct FileCtx {
+    session_id: String,
+    agent_id: String, // empty for main session file
+}
+
 /// File watcher for Claude session files
 pub struct Watcher {
     claude_dir: PathBuf,
@@ -139,6 +150,15 @@ pub struct Watcher {
     watch_active: Arc<AtomicBool>,
     skip_history: Arc<AtomicBool>,
     active_window: Duration,
+
+    // fsnotify fields
+    use_notify: bool,
+    fs_event_rx: Option<Arc<Mutex<mpsc::Receiver<notify::Result<notify::Event>>>>>,
+    #[allow(dead_code)]
+    notify_watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
+    file_contexts: Arc<RwLock<HashMap<PathBuf, FileCtx>>>,
+    debounce_tx: mpsc::Sender<PathBuf>,
+    debounce_rx: Option<Arc<Mutex<mpsc::Receiver<PathBuf>>>>,
 }
 
 impl Watcher {
@@ -162,6 +182,23 @@ impl Watcher {
             poll_ms
         };
 
+        // Try to set up notify (filesystem events)
+        let (fs_event_tx, fs_event_rx) = mpsc::channel(256);
+        let (debounce_tx, debounce_rx) = mpsc::channel(256);
+
+        let (use_notify, notify_watcher) = {
+            let tx = fs_event_tx;
+            match RecommendedWatcher::new(
+                move |res| {
+                    let _ = tx.blocking_send(res);
+                },
+                notify::Config::default(),
+            ) {
+                Ok(w) => (true, Some(Arc::new(Mutex::new(w)))),
+                Err(_) => (false, None),
+            }
+        };
+
         let watcher = Self {
             claude_dir,
             poll_interval_ms,
@@ -176,6 +213,16 @@ impl Watcher {
             watch_active,
             skip_history,
             active_window: Duration::from_secs(ACTIVE_WINDOW_SECS),
+            use_notify,
+            fs_event_rx: if use_notify {
+                Some(Arc::new(Mutex::new(fs_event_rx)))
+            } else {
+                None
+            },
+            notify_watcher,
+            file_contexts: Arc::new(RwLock::new(HashMap::new())),
+            debounce_tx,
+            debounce_rx: Some(Arc::new(Mutex::new(debounce_rx))),
         };
 
         // Initialize sessions
@@ -276,14 +323,25 @@ impl Watcher {
     /// Start the watcher loop
     pub fn start(self: Arc<Self>) {
         let watcher = self.clone();
-        tokio::spawn(async move {
-            watcher.watch_loop().await;
-        });
+        if watcher.use_notify {
+            tokio::spawn(async move {
+                watcher.watch_loop_notify().await;
+            });
+        } else {
+            tokio::spawn(async move {
+                watcher.watch_loop_polling().await;
+            });
+        }
     }
 
     /// Stop the watcher
     pub fn stop(&self) {
         self.cancel_token.cancel();
+    }
+
+    /// Returns whether the watcher is using filesystem notifications
+    pub fn using_notify(&self) -> bool {
+        self.use_notify
     }
 
     /// Find a specific session by ID
@@ -422,8 +480,8 @@ impl Watcher {
         Ok(())
     }
 
-    /// Main watch loop
-    async fn watch_loop(&self) {
+    /// Polling-based watch loop (fallback)
+    async fn watch_loop_polling(&self) {
         let mut poll_interval = interval(Duration::from_millis(self.poll_interval_ms));
         let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
 
@@ -443,6 +501,274 @@ impl Watcher {
                 }
             }
         }
+    }
+
+    /// Notify-based watch loop using OS filesystem events
+    async fn watch_loop_notify(&self) {
+        let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
+
+        // Set up directory watches for discovery
+        self.add_directory_watches(&self.claude_dir.clone()).await;
+
+        // Register file watches for all known sessions
+        let sessions: Vec<Arc<Session>> = self.sessions.read().await.values().cloned().collect();
+        self.initialize_session_reading().await;
+        for session in &sessions {
+            self.register_session_watches(session).await;
+        }
+
+        // Take the receivers out (they're Option<Arc<Mutex<...>>>)
+        let fs_event_rx = self.fs_event_rx.clone().unwrap();
+        let debounce_rx = self.debounce_rx.clone().unwrap();
+
+        // Spawn debounce processor
+        let debounce_cancel = self.cancel_token.clone();
+        let debounce_self = Arc::new(DebounceContext {
+            file_contexts: self.file_contexts.clone(),
+            file_positions: self.file_positions.clone(),
+            item_tx: self.item_tx.clone(),
+            error_tx: self.error_tx.clone(),
+        });
+        let debounce_rx_clone = debounce_rx.clone();
+        tokio::spawn(async move {
+            Self::debounce_loop(debounce_self, debounce_rx_clone, debounce_cancel).await;
+        });
+
+        loop {
+            tokio::select! {
+                _ = self.cancel_token.cancelled() => {
+                    break;
+                }
+                event = async {
+                    fs_event_rx.lock().await.recv().await
+                } => {
+                    match event {
+                        Some(Ok(ev)) => self.handle_fs_event(ev).await,
+                        Some(Err(e)) => {
+                            let _ = self.error_tx.try_send(anyhow::anyhow!("notify: {}", e));
+                        }
+                        None => break,
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    self.cleanup_file_positions().await;
+                }
+            }
+        }
+    }
+
+    /// Add recursive directory watches via notify
+    async fn add_directory_watches(&self, root: &Path) {
+        if let Some(ref nw) = self.notify_watcher {
+            let mut watcher = nw.lock().await;
+            let _ = watcher.watch(root, RecursiveMode::Recursive);
+        }
+    }
+
+    /// Register file watches and context for a session's files
+    async fn register_session_watches(&self, session: &Session) {
+        // Register main file context
+        self.add_file_context(&session.main_file, &session.id, "")
+            .await;
+
+        // Register subagent file contexts
+        let subagents = session.subagents.read().await;
+        for (agent_id, path) in subagents.iter() {
+            self.add_file_context(path, &session.id, agent_id).await;
+        }
+    }
+
+    /// Register a file's context for event routing
+    async fn add_file_context(&self, path: &Path, session_id: &str, agent_id: &str) {
+        self.file_contexts.write().await.insert(
+            path.to_path_buf(),
+            FileCtx {
+                session_id: session_id.to_string(),
+                agent_id: agent_id.to_string(),
+            },
+        );
+    }
+
+    /// Handle a filesystem event from notify
+    async fn handle_fs_event(&self, event: notify::Event) {
+        for path in &event.paths {
+            match event.kind {
+                EventKind::Create(_) => {
+                    self.handle_fs_create(path).await;
+                }
+                EventKind::Modify(_) => {
+                    self.handle_fs_write(path).await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Handle file/directory creation
+    async fn handle_fs_create(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+
+        // New .jsonl file — session or subagent
+        if path_str.ends_with(".jsonl") {
+            if path_str.contains("/subagents/") {
+                self.handle_new_subagent_file(path).await;
+            } else if self.watch_active.load(Ordering::SeqCst) {
+                self.handle_new_session_file(path).await;
+            }
+            return;
+        }
+
+        // New .txt in tool-results/ — background task
+        if path_str.ends_with(".txt") && path_str.contains("/tool-results/") {
+            self.handle_new_tool_result_file(path).await;
+        }
+    }
+
+    /// Handle file write (send to debounce channel)
+    async fn handle_fs_write(&self, path: &Path) {
+        let has_ctx = self.file_contexts.read().await.contains_key(path);
+        if !has_ctx {
+            return;
+        }
+        let _ = self.debounce_tx.try_send(path.to_path_buf());
+    }
+
+    /// Handle discovery of a new session JSONL file
+    async fn handle_new_session_file(&self, path: &Path) {
+        if !is_main_session_file(path) {
+            return;
+        }
+
+        let session = match self.build_session(path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let id = session.id.clone();
+        let project_path = session.project_path.clone();
+
+        let mut sessions = self.sessions.write().await;
+        if sessions.contains_key(&id) {
+            return;
+        }
+        let session = Arc::new(session);
+        sessions.insert(id.clone(), session.clone());
+        drop(sessions);
+
+        self.register_session_watches(&session).await;
+
+        let _ = self.new_session_tx.try_send(NewSessionMsg {
+            session_id: id,
+            project_path,
+        });
+    }
+
+    /// Handle discovery of a new subagent JSONL file
+    async fn handle_new_subagent_file(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+        if !path_str.ends_with(".jsonl") {
+            return;
+        }
+
+        let agent_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .trim_start_matches("agent-")
+            .trim_end_matches(".jsonl")
+            .to_string();
+
+        // Walk up: .../projects/<project>/<sessionID>/subagents/agent-<id>.jsonl
+        let session_id = path
+            .parent() // subagents/
+            .and_then(|p| p.parent()) // <sessionID>/
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let sessions = self.sessions.read().await;
+        let session = match sessions.get(&session_id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        drop(sessions);
+
+        let mut subagents = session.subagents.write().await;
+        if subagents.contains_key(&agent_id) {
+            return;
+        }
+        subagents.insert(agent_id.clone(), path.to_path_buf());
+        drop(subagents);
+
+        self.add_file_context(path, &session_id, &agent_id).await;
+
+        let _ = self.new_agent_tx.try_send(NewAgentMsg {
+            session_id,
+            agent_id,
+        });
+    }
+
+    /// Handle discovery of a new background task output file
+    async fn handle_new_tool_result_file(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+        if !path_str.ends_with(".txt") {
+            return;
+        }
+
+        let tool_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .trim_end_matches(".txt")
+            .to_string();
+
+        // Walk up: .../projects/<project>/<sessionID>/tool-results/<toolID>.txt
+        let session_id = path
+            .parent() // tool-results/
+            .and_then(|p| p.parent()) // <sessionID>/
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let sessions = self.sessions.read().await;
+        let session = match sessions.get(&session_id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        drop(sessions);
+
+        if session.background_tasks.read().await.contains_key(&tool_id) {
+            return;
+        }
+
+        let (parent_agent_id, tool_name) =
+            self.find_background_task_parent(&session, &tool_id).await;
+        let is_complete = self.is_background_task_complete(&session, &tool_id).await;
+
+        let task = BackgroundTask {
+            tool_id: tool_id.clone(),
+            parent_agent_id: parent_agent_id.clone(),
+            tool_name: tool_name.clone(),
+            output_path: path.to_path_buf(),
+            is_complete,
+        };
+
+        session
+            .background_tasks
+            .write()
+            .await
+            .insert(tool_id.clone(), task);
+
+        let _ = self.new_background_task_tx.try_send(NewBackgroundTaskMsg {
+            session_id,
+            parent_agent_id,
+            tool_id,
+            tool_name,
+            output_path: path.to_path_buf(),
+            is_complete,
+        });
     }
 
     /// Initialize reading from session files
@@ -960,6 +1286,129 @@ impl Watcher {
         let mut positions = self.file_positions.write().await;
         positions.retain(|path, _| path.exists());
     }
+
+    /// Debounce loop: coalesces rapid file writes, then reads once per file
+    async fn debounce_loop(
+        ctx: Arc<DebounceContext>,
+        rx: Arc<Mutex<mpsc::Receiver<PathBuf>>>,
+        cancel: CancellationToken,
+    ) {
+        let debounce_dur = Duration::from_millis(DEBOUNCE_INTERVAL_MS);
+        let mut pending: HashMap<PathBuf, tokio::time::Instant> = HashMap::new();
+        let mut rx_guard = rx.lock().await;
+
+        loop {
+            // If we have pending items, use a short timeout to check readiness
+            let timeout_dur = if pending.is_empty() {
+                Duration::from_secs(60) // long wait when nothing pending
+            } else {
+                Duration::from_millis(DEBOUNCE_INTERVAL_MS / 2)
+            };
+
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                path = rx_guard.recv() => {
+                    match path {
+                        Some(p) => {
+                            pending.insert(p, tokio::time::Instant::now());
+                        }
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep(timeout_dur), if !pending.is_empty() => {
+                    let now = tokio::time::Instant::now();
+                    let ready: Vec<PathBuf> = pending
+                        .iter()
+                        .filter(|(_, ts)| now.duration_since(**ts) >= debounce_dur)
+                        .map(|(p, _)| p.clone())
+                        .collect();
+
+                    for path in ready {
+                        pending.remove(&path);
+                        ctx.read_file(&path).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shared context for the debounce loop (avoids borrowing the full Watcher)
+struct DebounceContext {
+    file_contexts: Arc<RwLock<HashMap<PathBuf, FileCtx>>>,
+    file_positions: Arc<RwLock<HashMap<PathBuf, u64>>>,
+    item_tx: mpsc::Sender<StreamItem>,
+    error_tx: mpsc::Sender<anyhow::Error>,
+}
+
+impl DebounceContext {
+    /// Read new content from a file (same logic as Watcher::read_file, using shared state)
+    async fn read_file(&self, path: &Path) {
+        let ctx = match self.file_contexts.read().await.get(path).cloned() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let pos = self
+            .file_positions
+            .read()
+            .await
+            .get(path)
+            .copied()
+            .unwrap_or(0);
+
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            return;
+        }
+
+        let reader = BufReader::with_capacity(FILE_READ_BUFFER_SIZE, &file);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = self.error_tx.try_send(e.into());
+                    continue;
+                }
+            };
+
+            let items = match parser::parse_line(&line) {
+                Ok(items) => items,
+                Err(e) => {
+                    let _ = self.error_tx.try_send(e);
+                    continue;
+                }
+            };
+
+            for mut item in items {
+                item.session_id = ctx.session_id.clone();
+
+                if !ctx.agent_id.is_empty() && item.agent_id.is_empty() {
+                    item.agent_id = ctx.agent_id.clone();
+                    item.agent_name = format!(
+                        "Agent-{}",
+                        &ctx.agent_id[..ctx.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
+                    );
+                }
+
+                if self.item_tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        if let Ok(new_pos) = file.stream_position() {
+            self.file_positions
+                .write()
+                .await
+                .insert(path.to_path_buf(), new_pos);
+        }
+    }
 }
 
 /// List recent sessions
@@ -1033,4 +1482,268 @@ fn list_sessions_filtered(limit: usize, active_within: Duration) -> Result<Vec<S
     }
 
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn jsonl_line() -> &'static str {
+        r#"{"type":"assistant","sessionId":"test-sess","agentId":"","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"test thought"}]}}"#
+    }
+
+    #[test]
+    fn test_is_main_session_file() {
+        let dir = TempDir::new().unwrap();
+        let valid = dir.path().join("abc123.jsonl");
+        fs::write(&valid, "").unwrap();
+        assert!(is_main_session_file(&valid));
+
+        let subagent = dir.path().join("subagents");
+        fs::create_dir_all(&subagent).unwrap();
+        let sub_file = subagent.join("agent-xyz.jsonl");
+        // Create a path that contains /subagents/ - need to test with string
+        // The function checks path string for "/subagents/"
+        fs::write(&sub_file, "").unwrap();
+        assert!(!is_main_session_file(&sub_file));
+
+        let agent_prefix = dir.path().join("agent-abc.jsonl");
+        fs::write(&agent_prefix, "").unwrap();
+        assert!(!is_main_session_file(&agent_prefix));
+
+        let non_jsonl = dir.path().join("readme.txt");
+        fs::write(&non_jsonl, "").unwrap();
+        assert!(!is_main_session_file(&non_jsonl));
+    }
+
+    #[test]
+    fn test_resolve_project_path_fallback() {
+        let result = resolve_project_path("-nonexistent-path-segments");
+        assert_eq!(result, "nonexistent/path/segments");
+    }
+
+    #[test]
+    fn test_resolve_project_path_empty() {
+        assert_eq!(resolve_project_path("-"), "");
+        assert_eq!(resolve_project_path(""), "");
+    }
+
+    #[test]
+    fn test_count_file_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        assert_eq!(Watcher::count_file_lines(&path), 3);
+    }
+
+    #[test]
+    fn test_count_file_lines_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        fs::write(&path, "").unwrap();
+        assert_eq!(Watcher::count_file_lines(&path), 0);
+    }
+
+    #[test]
+    fn test_count_file_lines_nonexistent() {
+        assert_eq!(Watcher::count_file_lines(Path::new("/nonexistent")), 0);
+    }
+
+    #[test]
+    fn test_extract_field() {
+        assert_eq!(
+            Watcher::extract_field(r#"{"command":"ls -la"}"#, "command"),
+            Some("ls -la".to_string())
+        );
+        assert_eq!(
+            Watcher::extract_field(r#"{"command": "ls -la"}"#, "command"),
+            Some("ls -la".to_string())
+        );
+        assert_eq!(
+            Watcher::extract_field(r#"{"other":"value"}"#, "command"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_tool_name() {
+        assert_eq!(
+            Watcher::format_tool_name("Bash", r#"{"command":"npm install"}"#),
+            "Bash: npm install"
+        );
+        assert_eq!(
+            Watcher::format_tool_name("Bash", r#"{"other":"value"}"#),
+            "Bash"
+        );
+        assert_eq!(
+            Watcher::format_tool_name("Read", r#"{"file_path":"/foo"}"#),
+            "Read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_using_notify() {
+        let dir = TempDir::new().unwrap();
+        // Create the "projects" subdir that get_claude_projects_dir expects
+        let projects_dir = dir.path().join("projects");
+        fs::create_dir_all(&projects_dir).unwrap();
+
+        std::env::set_var("CLAUDE_HOME", dir.path());
+        let (w, _ch) = Watcher::new(None, 100).await.unwrap();
+        std::env::remove_var("CLAUDE_HOME");
+
+        // On Linux/macOS, notify should be available
+        assert!(w.using_notify(), "expected notify mode on this platform");
+    }
+
+    #[tokio::test]
+    async fn test_notify_file_watch() {
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects");
+        let project_dir = projects_dir.join("-test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let session_file = project_dir.join("sess001.jsonl");
+        fs::write(&session_file, "").unwrap();
+
+        std::env::set_var("CLAUDE_HOME", dir.path());
+        let (w, mut ch) = Watcher::new(Some("sess001"), 100).await.unwrap();
+        std::env::remove_var("CLAUDE_HOME");
+
+        let w = Arc::new(w);
+        w.clone().start();
+
+        // Give watcher time to set up watches and debounce loop
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Write a JSONL line and flush explicitly
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&session_file)
+                .unwrap();
+            writeln!(f, "{}", jsonl_line()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Wait for item (debounce is 50ms + processing time)
+        let item = tokio::time::timeout(Duration::from_secs(3), ch.items.recv()).await;
+        assert!(item.is_ok(), "timed out waiting for item");
+        let item = item.unwrap().unwrap();
+        assert_eq!(item.session_id, "sess001");
+    }
+
+    #[tokio::test]
+    async fn test_notify_new_subagent_discovery() {
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects");
+        let project_dir = projects_dir.join("-test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let session_file = project_dir.join("sess002.jsonl");
+        fs::write(&session_file, "").unwrap();
+
+        // Create subagents dir
+        let subagent_dir = project_dir.join("sess002").join("subagents");
+        fs::create_dir_all(&subagent_dir).unwrap();
+
+        std::env::set_var("CLAUDE_HOME", dir.path());
+        let (w, mut ch) = Watcher::new(Some("sess002"), 100).await.unwrap();
+        std::env::remove_var("CLAUDE_HOME");
+
+        let w = Arc::new(w);
+        w.clone().start();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Create a new subagent file
+        let agent_file = subagent_dir.join("agent-abc1234.jsonl");
+        fs::write(&agent_file, "").unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), ch.new_agent.recv()).await;
+        assert!(msg.is_ok(), "timed out waiting for new agent");
+        let msg = msg.unwrap().unwrap();
+        assert_eq!(msg.session_id, "sess002");
+        assert_eq!(msg.agent_id, "abc1234");
+    }
+
+    #[tokio::test]
+    async fn test_notify_new_background_task() {
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects");
+        let project_dir = projects_dir.join("-test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let session_file = project_dir.join("sess003.jsonl");
+        fs::write(&session_file, "").unwrap();
+
+        let tool_results_dir = project_dir.join("sess003").join("tool-results");
+        fs::create_dir_all(&tool_results_dir).unwrap();
+
+        std::env::set_var("CLAUDE_HOME", dir.path());
+        let (w, mut ch) = Watcher::new(Some("sess003"), 100).await.unwrap();
+        std::env::remove_var("CLAUDE_HOME");
+
+        let w = Arc::new(w);
+        w.clone().start();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Create a tool result file
+        let tool_file = tool_results_dir.join("toolu_01ABC.txt");
+        fs::write(&tool_file, "task output").unwrap();
+
+        let msg =
+            tokio::time::timeout(Duration::from_secs(2), ch.new_background_task.recv()).await;
+        assert!(msg.is_ok(), "timed out waiting for background task");
+        let msg = msg.unwrap().unwrap();
+        assert_eq!(msg.session_id, "sess003");
+        assert_eq!(msg.tool_id, "toolu_01ABC");
+    }
+
+    #[tokio::test]
+    async fn test_debounce_coalesces() {
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects");
+        let project_dir = projects_dir.join("-test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let session_file = project_dir.join("sess004.jsonl");
+        fs::write(&session_file, "").unwrap();
+
+        std::env::set_var("CLAUDE_HOME", dir.path());
+        let (w, mut ch) = Watcher::new(Some("sess004"), 100).await.unwrap();
+        std::env::remove_var("CLAUDE_HOME");
+
+        let w = Arc::new(w);
+        w.clone().start();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Write 5 lines rapidly and flush
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&session_file)
+                .unwrap();
+            for _ in 0..5 {
+                writeln!(f, "{}", jsonl_line()).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            f.sync_all().unwrap();
+        }
+
+        // Collect all items
+        let mut items = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while items.len() < 5 {
+            match tokio::time::timeout_at(deadline, ch.items.recv()).await {
+                Ok(Some(item)) => items.push(item),
+                _ => break,
+            }
+        }
+        assert_eq!(items.len(), 5, "expected 5 items from debounced reads");
+    }
 }

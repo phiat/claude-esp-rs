@@ -31,7 +31,7 @@ struct Cli {
     #[arg(short = 'n')]
     skip_history: bool,
 
-    /// Poll interval in milliseconds (min 100)
+    /// Poll interval in ms, fallback mode only (min 100)
     #[arg(short = 'p', default_value = "500")]
     poll_ms: u64,
 }
