@@ -1,6 +1,6 @@
 [package]
 name = "claude-esp"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Stream Claude Code's hidden output to a separate terminal"
 license = "MIT"
