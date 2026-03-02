@@ -1731,8 +1731,7 @@ mod tests {
         let tool_file = tool_results_dir.join("toolu_01ABC.txt");
         fs::write(&tool_file, "task output").unwrap();
 
-        let msg =
-            tokio::time::timeout(Duration::from_secs(2), ch.new_background_task.recv()).await;
+        let msg = tokio::time::timeout(Duration::from_secs(2), ch.new_background_task.recv()).await;
         assert!(msg.is_ok(), "timed out waiting for background task");
         let msg = msg.unwrap().unwrap();
         assert_eq!(msg.session_id, "sess003");
