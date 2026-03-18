@@ -87,7 +87,10 @@ impl App {
             let subagents = session.subagents.read().await;
             let subagent_types = session.subagent_types.read().await;
             for agent_id in subagents.keys() {
-                let agent_type = subagent_types.get(agent_id).map(|s| s.as_str()).unwrap_or("");
+                let agent_type = subagent_types
+                    .get(agent_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 tree.add_agent(&session.id, agent_id, agent_type);
             }
         }
@@ -346,7 +349,8 @@ impl App {
 
         // Poll new agent channel
         while let Ok(msg) = self.new_agent_rx.try_recv() {
-            self.tree.add_agent(&msg.session_id, &msg.agent_id, &msg.agent_type);
+            self.tree
+                .add_agent(&msg.session_id, &msg.agent_id, &msg.agent_type);
             self.stream
                 .set_enabled_filters(self.tree.get_enabled_filters());
         }

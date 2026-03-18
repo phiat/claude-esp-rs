@@ -145,7 +145,7 @@ pub struct WatcherChannels {
 #[derive(Clone)]
 struct FileCtx {
     session_id: String,
-    agent_id: String,  // empty for main session file
+    agent_id: String,   // empty for main session file
     agent_type: String, // from .meta.json, empty if not available
 }
 
@@ -622,7 +622,10 @@ impl Watcher {
         let subagents = session.subagents.read().await;
         let subagent_types = session.subagent_types.read().await;
         for (agent_id, path) in subagents.iter() {
-            let agent_type = subagent_types.get(agent_id).map(|s| s.as_str()).unwrap_or("");
+            let agent_type = subagent_types
+                .get(agent_id)
+                .map(|s| s.as_str())
+                .unwrap_or("");
             self.add_file_context(path, &session.id, agent_id, agent_type)
                 .await;
         }
@@ -1283,7 +1286,8 @@ impl Watcher {
     /// Read session files from last known position
     async fn read_session_files(&self, session: &Session) {
         // Read main file
-        self.read_file(&session.main_file, &session.id, "", "").await;
+        self.read_file(&session.main_file, &session.id, "", "")
+            .await;
 
         // Read subagent files with their types
         let subagents: Vec<_> = session
@@ -1296,8 +1300,12 @@ impl Watcher {
         let subagent_types = session.subagent_types.read().await;
 
         for (agent_id, path) in subagents {
-            let agent_type = subagent_types.get(&agent_id).map(|s| s.as_str()).unwrap_or("");
-            self.read_file(&path, &session.id, &agent_id, agent_type).await;
+            let agent_type = subagent_types
+                .get(&agent_id)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            self.read_file(&path, &session.id, &agent_id, agent_type)
+                .await;
         }
     }
 
