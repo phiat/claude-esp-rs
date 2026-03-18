@@ -333,6 +333,7 @@ impl App {
 
     async fn poll_watcher(&mut self) {
         // Poll items channel
+        // Token accumulation includes history — shows total session cost
         while let Ok(item) = self.item_rx.try_recv() {
             if let Some(t) = item.input_tokens {
                 self.total_input_tokens += t;

@@ -145,7 +145,8 @@ pub struct WatcherChannels {
 #[derive(Clone)]
 struct FileCtx {
     session_id: String,
-    agent_id: String, // empty for main session file
+    agent_id: String,  // empty for main session file
+    agent_type: String, // from .meta.json, empty if not available
 }
 
 /// File watcher for Claude session files
@@ -614,23 +615,33 @@ impl Watcher {
     /// Register file watches and context for a session's files
     async fn register_session_watches(&self, session: &Session) {
         // Register main file context
-        self.add_file_context(&session.main_file, &session.id, "")
+        self.add_file_context(&session.main_file, &session.id, "", "")
             .await;
 
-        // Register subagent file contexts
+        // Register subagent file contexts with types
         let subagents = session.subagents.read().await;
+        let subagent_types = session.subagent_types.read().await;
         for (agent_id, path) in subagents.iter() {
-            self.add_file_context(path, &session.id, agent_id).await;
+            let agent_type = subagent_types.get(agent_id).map(|s| s.as_str()).unwrap_or("");
+            self.add_file_context(path, &session.id, agent_id, agent_type)
+                .await;
         }
     }
 
     /// Register a file's context for event routing
-    async fn add_file_context(&self, path: &Path, session_id: &str, agent_id: &str) {
+    async fn add_file_context(
+        &self,
+        path: &Path,
+        session_id: &str,
+        agent_id: &str,
+        agent_type: &str,
+    ) {
         self.file_contexts.write().await.insert(
             path.to_path_buf(),
             FileCtx {
                 session_id: session_id.to_string(),
                 agent_id: agent_id.to_string(),
+                agent_type: agent_type.to_string(),
             },
         );
     }
@@ -762,7 +773,8 @@ impl Watcher {
             types.insert(agent_id.clone(), agent_type.clone());
         }
 
-        self.add_file_context(path, &session_id, &agent_id).await;
+        self.add_file_context(path, &session_id, &agent_id, &agent_type)
+            .await;
 
         let _ = self.new_agent_tx.try_send(NewAgentMsg {
             session_id,
@@ -1271,9 +1283,9 @@ impl Watcher {
     /// Read session files from last known position
     async fn read_session_files(&self, session: &Session) {
         // Read main file
-        self.read_file(&session.main_file, &session.id, "").await;
+        self.read_file(&session.main_file, &session.id, "", "").await;
 
-        // Read subagent files
+        // Read subagent files with their types
         let subagents: Vec<_> = session
             .subagents
             .read()
@@ -1281,14 +1293,16 @@ impl Watcher {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let subagent_types = session.subagent_types.read().await;
 
         for (agent_id, path) in subagents {
-            self.read_file(&path, &session.id, &agent_id).await;
+            let agent_type = subagent_types.get(&agent_id).map(|s| s.as_str()).unwrap_or("");
+            self.read_file(&path, &session.id, &agent_id, agent_type).await;
         }
     }
 
     /// Read new content from a file
-    async fn read_file(&self, path: &Path, session_id: &str, agent_id: &str) {
+    async fn read_file(&self, path: &Path, session_id: &str, agent_id: &str, agent_type: &str) {
         let mut file = match File::open(path) {
             Ok(f) => f,
             Err(_) => return,
@@ -1331,10 +1345,18 @@ impl Watcher {
 
                 if !agent_id.is_empty() && item.agent_id.is_empty() {
                     item.agent_id = agent_id.to_string();
-                    item.agent_name = format!(
-                        "Agent-{}",
-                        &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
-                    );
+                    if !agent_type.is_empty() {
+                        item.agent_name = if let Some(idx) = agent_type.rfind(':') {
+                            agent_type[idx + 1..].to_string()
+                        } else {
+                            agent_type.to_string()
+                        };
+                    } else {
+                        item.agent_name = format!(
+                            "Agent-{}",
+                            &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
+                        );
+                    }
                 }
 
                 if self.item_tx.send(item).await.is_err() {
@@ -1461,10 +1483,18 @@ impl DebounceContext {
 
                 if !ctx.agent_id.is_empty() && item.agent_id.is_empty() {
                     item.agent_id = ctx.agent_id.clone();
-                    item.agent_name = format!(
-                        "Agent-{}",
-                        &ctx.agent_id[..ctx.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
-                    );
+                    if !ctx.agent_type.is_empty() {
+                        item.agent_name = if let Some(idx) = ctx.agent_type.rfind(':') {
+                            ctx.agent_type[idx + 1..].to_string()
+                        } else {
+                            ctx.agent_type.clone()
+                        };
+                    } else {
+                        item.agent_name = format!(
+                            "Agent-{}",
+                            &ctx.agent_id[..ctx.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
+                        );
+                    }
                 }
 
                 if self.item_tx.send(item).await.is_err() {
