@@ -30,6 +30,9 @@ pub struct StreamItem {
     pub content: String,
     pub tool_name: Option<String>,
     pub tool_id: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
 }
 
 /// A background task launched by an agent
@@ -49,6 +52,7 @@ pub struct Session {
     pub project_path: String,
     pub main_file: PathBuf,
     pub subagents: Arc<RwLock<HashMap<String, PathBuf>>>,
+    pub subagent_types: Arc<RwLock<HashMap<String, String>>>,
     pub background_tasks: Arc<RwLock<HashMap<String, BackgroundTask>>>,
 }
 
@@ -59,6 +63,7 @@ impl Session {
             project_path,
             main_file,
             subagents: Arc::new(RwLock::new(HashMap::new())),
+            subagent_types: Arc::new(RwLock::new(HashMap::new())),
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -86,6 +91,7 @@ pub struct EnabledFilter {
 pub struct NewAgentMsg {
     pub session_id: String,
     pub agent_id: String,
+    pub agent_type: String,
 }
 
 /// Message signaling a new session was discovered

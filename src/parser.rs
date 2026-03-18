@@ -17,6 +17,8 @@ struct RawMessage {
     timestamp: String,
     #[serde(default)]
     message: Value,
+    #[serde(default)]
+    tool_use_result: Value,
 }
 
 /// Assistant message content
@@ -113,6 +115,18 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
         Err(_) => return vec![],
     };
 
+    // Extract token usage from message.usage
+    let input_tokens = raw
+        .message
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_i64());
+    let output_tokens = raw
+        .message
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_i64());
+
     let agent_name = if raw.agent_id.is_empty() {
         "Main".to_string()
     } else {
@@ -123,8 +137,17 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
     };
 
     let mut items = Vec::new();
+    let mut first = true;
 
     for block in msg.content {
+        // Only attach token counts to the first item
+        let (itok, otok) = if first {
+            first = false;
+            (input_tokens, output_tokens)
+        } else {
+            (None, None)
+        };
+
         match block.block_type.as_str() {
             "thinking" if !block.thinking.is_empty() => {
                 items.push(StreamItem {
@@ -136,6 +159,9 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     content: block.thinking,
                     tool_name: None,
                     tool_id: None,
+                    duration_ms: None,
+                    input_tokens: itok,
+                    output_tokens: otok,
                 });
             }
             "text" if !block.text.is_empty() => {
@@ -148,6 +174,9 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     content: block.text,
                     tool_name: None,
                     tool_id: None,
+                    duration_ms: None,
+                    input_tokens: itok,
+                    output_tokens: otok,
                 });
             }
             "tool_use" => {
@@ -161,6 +190,9 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     content,
                     tool_name: Some(block.name),
                     tool_id: Some(block.id),
+                    duration_ms: None,
+                    input_tokens: itok,
+                    output_tokens: otok,
                 });
             }
             _ => {}
@@ -179,6 +211,12 @@ fn parse_user_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamI
             &raw.agent_id[..raw.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
         )
     };
+
+    // Extract duration from toolUseResult.durationMs
+    let duration_ms = raw
+        .tool_use_result
+        .get("durationMs")
+        .and_then(|v| v.as_i64());
 
     let mut items = Vec::new();
 
@@ -211,6 +249,9 @@ fn parse_user_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamI
                             content: result_content,
                             tool_name: None,
                             tool_id: Some(tool_use_id),
+                            duration_ms,
+                            input_tokens: None,
+                            output_tokens: None,
                         });
                     }
                 }

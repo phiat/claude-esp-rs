@@ -119,6 +119,19 @@ fn is_main_session_file(path: &Path) -> bool {
     true
 }
 
+/// Read agent type from the .meta.json file adjacent to a subagent .jsonl file
+fn read_agent_type(jsonl_path: &Path) -> String {
+    let meta_path = jsonl_path.with_extension("meta.json");
+    if let Ok(content) = fs::read_to_string(&meta_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(agent_type) = val.get("agentType").and_then(|v| v.as_str()) {
+                return agent_type.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Channels for watcher output
 pub struct WatcherChannels {
     pub items: mpsc::Receiver<StreamItem>,
@@ -396,6 +409,7 @@ impl Watcher {
 
         // Find subagent files first (before creating Session)
         let mut subagents_map = HashMap::new();
+        let mut subagent_types_map = HashMap::new();
         let subagent_dir = main_file
             .parent()
             .map(|p| p.join(&id).join("subagents"))
@@ -410,6 +424,10 @@ impl Watcher {
                             .trim_start_matches("agent-")
                             .trim_end_matches(".jsonl")
                             .to_string();
+                        let agent_type = read_agent_type(&path);
+                        if !agent_type.is_empty() {
+                            subagent_types_map.insert(agent_id.clone(), agent_type);
+                        }
                         subagents_map.insert(agent_id, path);
                     }
                 }
@@ -421,6 +439,7 @@ impl Watcher {
             project_path,
             main_file: main_file.to_path_buf(),
             subagents: Arc::new(RwLock::new(subagents_map)),
+            subagent_types: Arc::new(RwLock::new(subagent_types_map)),
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -737,11 +756,18 @@ impl Watcher {
         subagents.insert(agent_id.clone(), path.to_path_buf());
         drop(subagents);
 
+        let agent_type = read_agent_type(path);
+        if !agent_type.is_empty() {
+            let mut types = session.subagent_types.write().await;
+            types.insert(agent_id.clone(), agent_type.clone());
+        }
+
         self.add_file_context(path, &session_id, &agent_id).await;
 
         let _ = self.new_agent_tx.try_send(NewAgentMsg {
             session_id,
             agent_id,
+            agent_type,
         });
     }
 
@@ -917,6 +943,14 @@ impl Watcher {
 
                     let exists = session.subagents.read().await.contains_key(&agent_id);
                     if !exists {
+                        let agent_type = read_agent_type(&path);
+                        if !agent_type.is_empty() {
+                            session
+                                .subagent_types
+                                .write()
+                                .await
+                                .insert(agent_id.clone(), agent_type.clone());
+                        }
                         session
                             .subagents
                             .write()
@@ -926,6 +960,7 @@ impl Watcher {
                         let _ = self.new_agent_tx.try_send(NewAgentMsg {
                             session_id: session.id.clone(),
                             agent_id,
+                            agent_type,
                         });
                     }
                 }

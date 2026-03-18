@@ -244,11 +244,18 @@ impl StreamView {
                     tool_input_header_style(),
                 )
             }
-            StreamItemType::ToolOutput => (
-                TOOL_OUTPUT_ICON,
-                " Output".to_string(),
-                tool_output_header_style(),
-            ),
+            StreamItemType::ToolOutput => {
+                let duration_str = match item.duration_ms {
+                    Some(ms) if ms >= 1000 => format!(" ({:.1}s)", ms as f64 / 1000.0),
+                    Some(ms) if ms > 0 => format!(" ({}ms)", ms),
+                    _ => String::new(),
+                };
+                (
+                    TOOL_OUTPUT_ICON,
+                    format!(" Output{}", duration_str),
+                    tool_output_header_style(),
+                )
+            }
             StreamItemType::Text => (TEXT_ICON, " Response".to_string(), text_header_style()),
         };
 
