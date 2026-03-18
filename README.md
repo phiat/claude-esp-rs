@@ -18,6 +18,9 @@ When using Claude Code interactively, tool outputs and thinking are collapsed by
 - **Hierarchical tree view** - Sessions with nested Main/Agent nodes
 - **Real-time streaming** - See thinking, tool calls, and outputs as they happen
 - **Subagent tracking** - Automatically discovers and displays subagent activity
+- **Agent type labels** - Shows agent types (Explore, code-reviewer, etc.) from `.meta.json`
+- **Token usage tracking** - Cumulative input/output token counts in the header bar
+- **Tool execution duration** - Shows how long each tool call took
 - **Background task visibility** - See background tasks (⏳/✓) under spawning agent
 - **Filtering** - Toggle visibility of thinking, tools, outputs per session/agent
 - **Auto-scroll** - Follows new output, or scroll freely through history
