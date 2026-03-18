@@ -118,7 +118,7 @@ impl TreeView {
     }
 
     /// Add an agent under a session
-    pub fn add_agent(&mut self, session_id: &str, agent_id: &str) {
+    pub fn add_agent(&mut self, session_id: &str, agent_id: &str, agent_type: &str) {
         let session = self
             .root
             .children
@@ -139,13 +139,17 @@ impl TreeView {
             return;
         }
 
-        let display_id = &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)];
-        let mut agent = TreeNode::new(
-            NodeType::Agent,
-            agent_id.to_string(),
-            format!("Agent-{}", display_id),
-        )
-        .with_session_id(session_id.to_string());
+        let display_name = if agent_type.is_empty() {
+            let display_id = &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)];
+            format!("Agent-{}", display_id)
+        } else if let Some(pos) = agent_type.rfind(':') {
+            agent_type[pos + 1..].to_string()
+        } else {
+            agent_type.to_string()
+        };
+
+        let mut agent = TreeNode::new(NodeType::Agent, agent_id.to_string(), display_name)
+            .with_session_id(session_id.to_string());
         agent.is_active = true;
 
         session.children.push(agent);

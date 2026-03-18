@@ -53,6 +53,8 @@ pub struct App {
     quitting: bool,
     error: Option<String>,
     cached_sessions: CachedSessionInfo,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
 
     // Watcher channels
     item_rx: mpsc::Receiver<StreamItem>,
@@ -83,8 +85,13 @@ impl App {
 
             // Add existing subagents
             let subagents = session.subagents.read().await;
+            let subagent_types = session.subagent_types.read().await;
             for agent_id in subagents.keys() {
-                tree.add_agent(&session.id, agent_id);
+                let agent_type = subagent_types
+                    .get(agent_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                tree.add_agent(&session.id, agent_id, agent_type);
             }
         }
 
@@ -103,6 +110,8 @@ impl App {
             quitting: false,
             error: None,
             cached_sessions,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             item_rx: channels.items,
             new_agent_rx: channels.new_agent,
             new_session_rx: channels.new_session,
@@ -311,6 +320,9 @@ impl App {
                     content,
                     tool_name: Some(format!("{} {}", status_icon, node.name)),
                     tool_id: Some(node.id.clone()),
+                    duration_ms: None,
+                    input_tokens: None,
+                    output_tokens: None,
                 };
 
                 self.stream.add_item(item);
@@ -324,13 +336,21 @@ impl App {
 
     async fn poll_watcher(&mut self) {
         // Poll items channel
+        // Token accumulation includes history — shows total session cost
         while let Ok(item) = self.item_rx.try_recv() {
+            if let Some(t) = item.input_tokens {
+                self.total_input_tokens += t;
+            }
+            if let Some(t) = item.output_tokens {
+                self.total_output_tokens += t;
+            }
             self.stream.add_item(item);
         }
 
         // Poll new agent channel
         while let Ok(msg) = self.new_agent_rx.try_recv() {
-            self.tree.add_agent(&msg.session_id, &msg.agent_id);
+            self.tree
+                .add_agent(&msg.session_id, &msg.agent_id, &msg.agent_type);
             self.stream
                 .set_enabled_filters(self.tree.get_enabled_filters());
         }
@@ -460,14 +480,25 @@ impl App {
             format!("{} sessions{}", self.cached_sessions.count, auto_disc)
         };
 
+        let token_info = if self.total_input_tokens > 0 || self.total_output_tokens > 0 {
+            format!(
+                "  │  {} in / {} out",
+                format_tokens(self.total_input_tokens),
+                format_tokens(self.total_output_tokens)
+            )
+        } else {
+            String::new()
+        };
+
         let header_text = format!(
-            "{}  {}  {}  {}  {}  │  {}",
+            "{}  {}  {}  {}  {}  │  {}{}",
             thinking_toggle,
             tool_input_toggle,
             tool_output_toggle,
             auto_scroll_toggle,
             tree_toggle,
-            session_info
+            session_info,
+            token_info
         );
 
         let header = Paragraph::new(Line::from(vec![Span::styled(header_text, header_style())]));
@@ -543,5 +574,15 @@ impl App {
 
         let help = Paragraph::new(Line::from(vec![Span::styled(help_text, help_style())]));
         f.render_widget(help, area);
+    }
+}
+
+fn format_tokens(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
     }
 }

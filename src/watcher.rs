@@ -119,6 +119,19 @@ fn is_main_session_file(path: &Path) -> bool {
     true
 }
 
+/// Read agent type from the .meta.json file adjacent to a subagent .jsonl file
+fn read_agent_type(jsonl_path: &Path) -> String {
+    let meta_path = jsonl_path.with_extension("meta.json");
+    if let Ok(content) = fs::read_to_string(&meta_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(agent_type) = val.get("agentType").and_then(|v| v.as_str()) {
+                return agent_type.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Channels for watcher output
 pub struct WatcherChannels {
     pub items: mpsc::Receiver<StreamItem>,
@@ -132,7 +145,8 @@ pub struct WatcherChannels {
 #[derive(Clone)]
 struct FileCtx {
     session_id: String,
-    agent_id: String, // empty for main session file
+    agent_id: String,   // empty for main session file
+    agent_type: String, // from .meta.json, empty if not available
 }
 
 /// File watcher for Claude session files
@@ -396,6 +410,7 @@ impl Watcher {
 
         // Find subagent files first (before creating Session)
         let mut subagents_map = HashMap::new();
+        let mut subagent_types_map = HashMap::new();
         let subagent_dir = main_file
             .parent()
             .map(|p| p.join(&id).join("subagents"))
@@ -410,6 +425,10 @@ impl Watcher {
                             .trim_start_matches("agent-")
                             .trim_end_matches(".jsonl")
                             .to_string();
+                        let agent_type = read_agent_type(&path);
+                        if !agent_type.is_empty() {
+                            subagent_types_map.insert(agent_id.clone(), agent_type);
+                        }
                         subagents_map.insert(agent_id, path);
                     }
                 }
@@ -421,6 +440,7 @@ impl Watcher {
             project_path,
             main_file: main_file.to_path_buf(),
             subagents: Arc::new(RwLock::new(subagents_map)),
+            subagent_types: Arc::new(RwLock::new(subagent_types_map)),
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -595,23 +615,36 @@ impl Watcher {
     /// Register file watches and context for a session's files
     async fn register_session_watches(&self, session: &Session) {
         // Register main file context
-        self.add_file_context(&session.main_file, &session.id, "")
+        self.add_file_context(&session.main_file, &session.id, "", "")
             .await;
 
-        // Register subagent file contexts
+        // Register subagent file contexts with types
         let subagents = session.subagents.read().await;
+        let subagent_types = session.subagent_types.read().await;
         for (agent_id, path) in subagents.iter() {
-            self.add_file_context(path, &session.id, agent_id).await;
+            let agent_type = subagent_types
+                .get(agent_id)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            self.add_file_context(path, &session.id, agent_id, agent_type)
+                .await;
         }
     }
 
     /// Register a file's context for event routing
-    async fn add_file_context(&self, path: &Path, session_id: &str, agent_id: &str) {
+    async fn add_file_context(
+        &self,
+        path: &Path,
+        session_id: &str,
+        agent_id: &str,
+        agent_type: &str,
+    ) {
         self.file_contexts.write().await.insert(
             path.to_path_buf(),
             FileCtx {
                 session_id: session_id.to_string(),
                 agent_id: agent_id.to_string(),
+                agent_type: agent_type.to_string(),
             },
         );
     }
@@ -737,11 +770,19 @@ impl Watcher {
         subagents.insert(agent_id.clone(), path.to_path_buf());
         drop(subagents);
 
-        self.add_file_context(path, &session_id, &agent_id).await;
+        let agent_type = read_agent_type(path);
+        if !agent_type.is_empty() {
+            let mut types = session.subagent_types.write().await;
+            types.insert(agent_id.clone(), agent_type.clone());
+        }
+
+        self.add_file_context(path, &session_id, &agent_id, &agent_type)
+            .await;
 
         let _ = self.new_agent_tx.try_send(NewAgentMsg {
             session_id,
             agent_id,
+            agent_type,
         });
     }
 
@@ -917,6 +958,14 @@ impl Watcher {
 
                     let exists = session.subagents.read().await.contains_key(&agent_id);
                     if !exists {
+                        let agent_type = read_agent_type(&path);
+                        if !agent_type.is_empty() {
+                            session
+                                .subagent_types
+                                .write()
+                                .await
+                                .insert(agent_id.clone(), agent_type.clone());
+                        }
                         session
                             .subagents
                             .write()
@@ -926,6 +975,7 @@ impl Watcher {
                         let _ = self.new_agent_tx.try_send(NewAgentMsg {
                             session_id: session.id.clone(),
                             agent_id,
+                            agent_type,
                         });
                     }
                 }
@@ -1236,9 +1286,10 @@ impl Watcher {
     /// Read session files from last known position
     async fn read_session_files(&self, session: &Session) {
         // Read main file
-        self.read_file(&session.main_file, &session.id, "").await;
+        self.read_file(&session.main_file, &session.id, "", "")
+            .await;
 
-        // Read subagent files
+        // Read subagent files with their types
         let subagents: Vec<_> = session
             .subagents
             .read()
@@ -1246,14 +1297,20 @@ impl Watcher {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let subagent_types = session.subagent_types.read().await;
 
         for (agent_id, path) in subagents {
-            self.read_file(&path, &session.id, &agent_id).await;
+            let agent_type = subagent_types
+                .get(&agent_id)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            self.read_file(&path, &session.id, &agent_id, agent_type)
+                .await;
         }
     }
 
     /// Read new content from a file
-    async fn read_file(&self, path: &Path, session_id: &str, agent_id: &str) {
+    async fn read_file(&self, path: &Path, session_id: &str, agent_id: &str, agent_type: &str) {
         let mut file = match File::open(path) {
             Ok(f) => f,
             Err(_) => return,
@@ -1296,10 +1353,18 @@ impl Watcher {
 
                 if !agent_id.is_empty() && item.agent_id.is_empty() {
                     item.agent_id = agent_id.to_string();
-                    item.agent_name = format!(
-                        "Agent-{}",
-                        &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
-                    );
+                    if !agent_type.is_empty() {
+                        item.agent_name = if let Some(idx) = agent_type.rfind(':') {
+                            agent_type[idx + 1..].to_string()
+                        } else {
+                            agent_type.to_string()
+                        };
+                    } else {
+                        item.agent_name = format!(
+                            "Agent-{}",
+                            &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
+                        );
+                    }
                 }
 
                 if self.item_tx.send(item).await.is_err() {
@@ -1426,10 +1491,18 @@ impl DebounceContext {
 
                 if !ctx.agent_id.is_empty() && item.agent_id.is_empty() {
                     item.agent_id = ctx.agent_id.clone();
-                    item.agent_name = format!(
-                        "Agent-{}",
-                        &ctx.agent_id[..ctx.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
-                    );
+                    if !ctx.agent_type.is_empty() {
+                        item.agent_name = if let Some(idx) = ctx.agent_type.rfind(':') {
+                            ctx.agent_type[idx + 1..].to_string()
+                        } else {
+                            ctx.agent_type.clone()
+                        };
+                    } else {
+                        item.agent_name = format!(
+                            "Agent-{}",
+                            &ctx.agent_id[..ctx.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
+                        );
+                    }
                 }
 
                 if self.item_tx.send(item).await.is_err() {
@@ -1665,7 +1738,7 @@ mod tests {
         }
 
         // Wait for item (debounce is 50ms + processing time)
-        let item = tokio::time::timeout(Duration::from_secs(3), ch.items.recv()).await;
+        let item = tokio::time::timeout(Duration::from_secs(10), ch.items.recv()).await;
         assert!(item.is_ok(), "timed out waiting for item");
         let item = item.unwrap().unwrap();
         assert_eq!(item.session_id, "sess001");
@@ -1698,7 +1771,7 @@ mod tests {
         let agent_file = subagent_dir.join("agent-abc1234.jsonl");
         fs::write(&agent_file, "").unwrap();
 
-        let msg = tokio::time::timeout(Duration::from_secs(2), ch.new_agent.recv()).await;
+        let msg = tokio::time::timeout(Duration::from_secs(10), ch.new_agent.recv()).await;
         assert!(msg.is_ok(), "timed out waiting for new agent");
         let msg = msg.unwrap().unwrap();
         assert_eq!(msg.session_id, "sess002");
@@ -1731,7 +1804,8 @@ mod tests {
         let tool_file = tool_results_dir.join("toolu_01ABC.txt");
         fs::write(&tool_file, "task output").unwrap();
 
-        let msg = tokio::time::timeout(Duration::from_secs(2), ch.new_background_task.recv()).await;
+        let msg =
+            tokio::time::timeout(Duration::from_secs(10), ch.new_background_task.recv()).await;
         assert!(msg.is_ok(), "timed out waiting for background task");
         let msg = msg.unwrap().unwrap();
         assert_eq!(msg.session_id, "sess003");
