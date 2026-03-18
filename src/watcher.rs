@@ -1351,15 +1351,17 @@ impl Watcher {
             for mut item in items {
                 item.session_id = session_id.to_string();
 
-                if !agent_id.is_empty() && item.agent_id.is_empty() {
-                    item.agent_id = agent_id.to_string();
+                if !agent_id.is_empty() {
+                    if item.agent_id.is_empty() {
+                        item.agent_id = agent_id.to_string();
+                    }
                     if !agent_type.is_empty() {
                         item.agent_name = if let Some(idx) = agent_type.rfind(':') {
                             agent_type[idx + 1..].to_string()
                         } else {
                             agent_type.to_string()
                         };
-                    } else {
+                    } else if item.agent_name.is_empty() || item.agent_name.starts_with("Agent-") {
                         item.agent_name = format!(
                             "Agent-{}",
                             &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
@@ -1489,15 +1491,17 @@ impl DebounceContext {
             for mut item in items {
                 item.session_id = ctx.session_id.clone();
 
-                if !ctx.agent_id.is_empty() && item.agent_id.is_empty() {
-                    item.agent_id = ctx.agent_id.clone();
+                if !ctx.agent_id.is_empty() {
+                    if item.agent_id.is_empty() {
+                        item.agent_id = ctx.agent_id.clone();
+                    }
                     if !ctx.agent_type.is_empty() {
                         item.agent_name = if let Some(idx) = ctx.agent_type.rfind(':') {
                             ctx.agent_type[idx + 1..].to_string()
                         } else {
                             ctx.agent_type.clone()
                         };
-                    } else {
+                    } else if item.agent_name.is_empty() || item.agent_name.starts_with("Agent-") {
                         item.agent_name = format!(
                             "Agent-{}",
                             &ctx.agent_id[..ctx.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
