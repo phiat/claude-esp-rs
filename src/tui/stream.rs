@@ -359,9 +359,8 @@ impl Widget for &mut StreamView {
             let mut x = area.x;
 
             for span in line.spans.iter() {
-                // Calculate character width (accounting for Unicode)
-                let char_count: usize = span.content.chars().count();
-                let width = char_count as u16;
+                // Calculate display width (accounts for wide chars like emoji)
+                let width = unicode_width::UnicodeWidthStr::width(span.content.as_ref()) as u16;
 
                 if x + width > area.x + area.width {
                     break;
