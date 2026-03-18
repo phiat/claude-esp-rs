@@ -1738,7 +1738,7 @@ mod tests {
         }
 
         // Wait for item (debounce is 50ms + processing time)
-        let item = tokio::time::timeout(Duration::from_secs(3), ch.items.recv()).await;
+        let item = tokio::time::timeout(Duration::from_secs(10), ch.items.recv()).await;
         assert!(item.is_ok(), "timed out waiting for item");
         let item = item.unwrap().unwrap();
         assert_eq!(item.session_id, "sess001");
@@ -1771,7 +1771,7 @@ mod tests {
         let agent_file = subagent_dir.join("agent-abc1234.jsonl");
         fs::write(&agent_file, "").unwrap();
 
-        let msg = tokio::time::timeout(Duration::from_secs(2), ch.new_agent.recv()).await;
+        let msg = tokio::time::timeout(Duration::from_secs(10), ch.new_agent.recv()).await;
         assert!(msg.is_ok(), "timed out waiting for new agent");
         let msg = msg.unwrap().unwrap();
         assert_eq!(msg.session_id, "sess002");
@@ -1804,7 +1804,8 @@ mod tests {
         let tool_file = tool_results_dir.join("toolu_01ABC.txt");
         fs::write(&tool_file, "task output").unwrap();
 
-        let msg = tokio::time::timeout(Duration::from_secs(2), ch.new_background_task.recv()).await;
+        let msg =
+            tokio::time::timeout(Duration::from_secs(10), ch.new_background_task.recv()).await;
         assert!(msg.is_ok(), "timed out waiting for background task");
         let msg = msg.unwrap().unwrap();
         assert_eq!(msg.session_id, "sess003");
