@@ -265,7 +265,9 @@ impl StreamView {
                 // Look up the tool name from the matching ToolInput
                 let tool_name = item.tool_id.as_ref().and_then(|tid| {
                     self.items.iter().find_map(|i| {
-                        if i.item_type == StreamItemType::ToolInput && i.tool_id.as_ref() == Some(tid) {
+                        if i.item_type == StreamItemType::ToolInput
+                            && i.tool_id.as_ref() == Some(tid)
+                        {
                             i.tool_name.clone()
                         } else {
                             None
@@ -276,11 +278,7 @@ impl StreamView {
                     Some(name) => format!(" {} result{}", name, duration_str),
                     None => format!(" Output{}", duration_str),
                 };
-                (
-                    TOOL_OUTPUT_ICON,
-                    label,
-                    tool_output_header_style(),
-                )
+                (TOOL_OUTPUT_ICON, label, tool_output_header_style())
             }
             StreamItemType::Text => (TEXT_ICON, " Response".to_string(), text_header_style()),
         };
