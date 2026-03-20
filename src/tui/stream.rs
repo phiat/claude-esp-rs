@@ -69,13 +69,15 @@ impl StreamView {
 
     /// Add an item to the stream
     pub fn add_item(&mut self, item: StreamItem) {
-        // Deduplicate tool input/output by tool_id
+        // Deduplicate by (tool_id, item_type) so tool input and output
+        // with the same tool_id are both kept
         if let Some(ref tool_id) = item.tool_id {
             if !tool_id.is_empty() {
-                if self.seen_tool_ids.contains(tool_id) {
+                let dedup_key = format!("{}:{:?}", tool_id, item.item_type);
+                if self.seen_tool_ids.contains(&dedup_key) {
                     return; // Skip duplicate
                 }
-                self.seen_tool_ids.insert(tool_id.clone());
+                self.seen_tool_ids.insert(dedup_key);
             }
         }
 
@@ -260,9 +262,23 @@ impl StreamView {
                     Some(ms) if ms > 0 => format!(" ({}ms)", ms),
                     _ => String::new(),
                 };
+                // Look up the tool name from the matching ToolInput
+                let tool_name = item.tool_id.as_ref().and_then(|tid| {
+                    self.items.iter().find_map(|i| {
+                        if i.item_type == StreamItemType::ToolInput && i.tool_id.as_ref() == Some(tid) {
+                            i.tool_name.clone()
+                        } else {
+                            None
+                        }
+                    })
+                });
+                let label = match tool_name {
+                    Some(name) => format!(" {} result{}", name, duration_str),
+                    None => format!(" Output{}", duration_str),
+                };
                 (
                     TOOL_OUTPUT_ICON,
-                    format!(" Output{}", duration_str),
+                    label,
                     tool_output_header_style(),
                 )
             }
