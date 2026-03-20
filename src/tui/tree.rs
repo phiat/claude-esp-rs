@@ -250,6 +250,85 @@ impl TreeView {
         }
     }
 
+    /// Solo the selected node: disable all others, enable only this one.
+    /// If already soloed (i.e. it's the only enabled node), re-enable all.
+    pub fn solo(&mut self) {
+        let selected_path = match self.flat_nodes.get(self.cursor) {
+            Some(flat) => flat.node_idx.clone(),
+            None => return,
+        };
+
+        if self.is_soloed(&selected_path) {
+            // Un-solo: re-enable everything
+            Self::set_all_enabled(&mut self.root, true);
+        } else {
+            // Disable all sessions and their children (but keep root enabled
+            // so collect_enabled_filters can traverse it)
+            for session in &mut self.root.children {
+                Self::set_all_enabled(session, false);
+            }
+
+            // Enable the selected node and the path to it
+            match selected_path.len() {
+                // Selected a session node — enable it and all children
+                1 => {
+                    if let Some(session) = self.root.children.get_mut(selected_path[0]) {
+                        Self::set_all_enabled(session, true);
+                    }
+                }
+                // Selected a child (Main/Agent) — enable it and its parent session
+                _ => {
+                    if let Some(session) = self.root.children.get_mut(selected_path[0]) {
+                        session.enabled = true;
+                        if let Some(child) = self.get_node_by_path_mut(&selected_path) {
+                            child.enabled = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if the selected node is currently soloed
+    fn is_soloed(&self, selected_path: &[usize]) -> bool {
+        let selected = match self.get_node_by_path(selected_path) {
+            Some(n) => n,
+            None => return false,
+        };
+        if !selected.enabled {
+            return false;
+        }
+
+        // For a session: check all other sessions are fully disabled
+        // For a child: check all other Main/Agent nodes across all sessions are disabled
+        for (si, session) in self.root.children.iter().enumerate() {
+            if selected.node_type == NodeType::Session {
+                if si != selected_path[0] && session.enabled {
+                    return false;
+                }
+            } else {
+                for (ci, child) in session.children.iter().enumerate() {
+                    if child.node_type == NodeType::BackgroundTask {
+                        continue;
+                    }
+                    let is_selected = si == selected_path[0]
+                        && selected_path.get(1) == Some(&ci);
+                    if !is_selected && child.enabled {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn set_all_enabled(node: &mut TreeNode, enabled: bool) {
+        node.enabled = enabled;
+        for child in &mut node.children {
+            Self::set_all_enabled(child, enabled);
+        }
+    }
+
     /// Get the currently selected node
     pub fn get_selected_node(&self) -> Option<&TreeNode> {
         self.get_node_by_path(&self.flat_nodes.get(self.cursor)?.node_idx)

@@ -243,6 +243,14 @@ impl App {
                 }
             }
 
+            (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                if self.focus == Focus::Tree {
+                    self.tree.solo();
+                    self.stream
+                        .set_enabled_filters(self.tree.get_enabled_filters());
+                }
+            }
+
             (KeyCode::Char('g'), KeyModifiers::NONE) => {
                 self.stream.scroll_to_top();
             }
@@ -256,24 +264,8 @@ impl App {
                 }
             }
 
-            (KeyCode::Char('x'), KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
-                if self.focus == Focus::Tree {
-                    if let Some(session_id) = self.tree.get_selected_session() {
-                        let watcher = self.watcher.clone();
-                        let sid = session_id.clone();
-                        tokio::spawn(async move {
-                            watcher.remove_session(&sid).await;
-                        });
-                        self.tree.remove_session(&session_id);
-                        self.stream
-                            .set_enabled_filters(self.tree.get_enabled_filters());
-                        // Update cached session count
-                        self.cached_sessions.count = self.cached_sessions.count.saturating_sub(1);
-                        if self.cached_sessions.count != 1 {
-                            self.cached_sessions.single_session_id = None;
-                        }
-                    }
-                }
+            (KeyCode::Char('x'), KeyModifiers::NONE) => {
+                self.stream.toggle_text();
             }
 
             (KeyCode::Char('A'), KeyModifiers::SHIFT)
@@ -461,8 +453,9 @@ impl App {
             self.render_toggle("Tools", self.stream.is_tool_input_enabled(), "i");
         let tool_output_toggle =
             self.render_toggle("Output", self.stream.is_tool_output_enabled(), "o");
+        let text_toggle = self.render_toggle("Text", self.stream.is_text_enabled(), "x");
         let auto_scroll_toggle =
-            self.render_toggle("Auto", self.stream.is_auto_scroll_enabled(), "a");
+            self.render_toggle("Scroll", self.stream.is_auto_scroll_enabled(), "a");
         let tree_toggle = self.render_toggle("Tree", self.show_tree, "h");
 
         // Session info from cache
@@ -491,10 +484,11 @@ impl App {
         };
 
         let header_text = format!(
-            "{}  {}  {}  {}  {}  │  {}{}",
+            "{}  {}  {}  {}  {}  {}  │  {}{}",
             thinking_toggle,
             tool_input_toggle,
             tool_output_toggle,
+            text_toggle,
             auto_scroll_toggle,
             tree_toggle,
             session_info,
@@ -567,7 +561,7 @@ impl App {
 
     fn render_help(&self, f: &mut Frame, area: Rect) {
         let help_text = if self.focus == Focus::Tree {
-            "j/k: navigate │ space: toggle │ x: remove │ A: auto-discover │ q: quit"
+            "j/k: navigate │ space: toggle │ s: solo │ A: auto-discover │ q: quit"
         } else {
             "j/k: scroll │ g/G: top/bottom │ A: auto-discover │ tab: tree │ q: quit"
         };
