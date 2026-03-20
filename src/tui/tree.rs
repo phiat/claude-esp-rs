@@ -311,8 +311,7 @@ impl TreeView {
                     if child.node_type == NodeType::BackgroundTask {
                         continue;
                     }
-                    let is_selected = si == selected_path[0]
-                        && selected_path.get(1) == Some(&ci);
+                    let is_selected = si == selected_path[0] && selected_path.get(1) == Some(&ci);
                     if !is_selected && child.enabled {
                         return false;
                     }
