@@ -51,7 +51,7 @@ impl StreamView {
             show_thinking: true,
             show_tool_input: true,
             show_tool_output: true,
-            show_text: false,
+            show_text: true,
             enabled_filters: Vec::new(),
             rendered_lines: Vec::new(),
             needs_rerender: true,
@@ -113,6 +113,12 @@ impl StreamView {
         self.needs_rerender = true;
     }
 
+    /// Toggle text visibility
+    pub fn toggle_text(&mut self) {
+        self.show_text = !self.show_text;
+        self.needs_rerender = true;
+    }
+
     /// Toggle auto-scroll
     pub fn toggle_auto_scroll(&mut self) {
         self.auto_scroll = !self.auto_scroll;
@@ -162,6 +168,10 @@ impl StreamView {
 
     pub fn is_tool_output_enabled(&self) -> bool {
         self.show_tool_output
+    }
+
+    pub fn is_text_enabled(&self) -> bool {
+        self.show_text
     }
 
     pub fn is_auto_scroll_enabled(&self) -> bool {
