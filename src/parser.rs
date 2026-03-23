@@ -409,4 +409,36 @@ mod tests {
         let result = parse_line(line).unwrap();
         assert!(result.is_empty()); // User prompts are not shown
     }
+
+    #[test]
+    fn test_parse_invalid_json() {
+        // Invalid JSON should be silently skipped
+        let result = parse_line("not json at all").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_truncated_json() {
+        // Truncated JSON (e.g. from oversized image) should be skipped
+        let line = r#"{"type":"user","sessionId":"sess-123","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"JVBER"#;
+        let result = parse_line(line).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_message_with_image() {
+        // Image blocks should be silently skipped
+        let line = r#"{"type":"user","sessionId":"sess-123","agentId":"","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo"}}]}}"#;
+        let result = parse_line(line).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_message_with_image_and_tool_result() {
+        // Image + tool_result: only tool_result should be returned
+        let line = r#"{"type":"user","sessionId":"sess-123","agentId":"","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"iVBOR"}},{"type":"tool_result","tool_use_id":"toolu_img1","content":"tool output here"}]}}"#;
+        let result = parse_line(line).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content, "tool output here");
+    }
 }
