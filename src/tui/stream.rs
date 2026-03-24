@@ -324,14 +324,31 @@ impl StreamView {
             (&lines[..], 0)
         };
 
-        // Word wrap each line
+        // Word wrap each line using display width (handles CJK/emoji correctly)
+        use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
         let mut wrapped: Vec<String> = Vec::new();
         for line in lines {
-            if line.len() > width && width > 0 {
+            let line_width = UnicodeWidthStr::width(*line);
+            if line_width > width && width > 0 {
                 let mut remaining = *line;
-                while remaining.len() > width {
-                    wrapped.push(remaining[..width].to_string());
-                    remaining = &remaining[width..];
+                while UnicodeWidthStr::width(remaining) > width {
+                    let mut col = 0;
+                    let mut split_at = 0;
+                    for (idx, ch) in remaining.char_indices() {
+                        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if col + cw > width {
+                            break;
+                        }
+                        col += cw;
+                        split_at = idx + ch.len_utf8();
+                    }
+                    if split_at == 0 {
+                        // Single char wider than width — force advance
+                        let ch = remaining.chars().next().unwrap();
+                        split_at = ch.len_utf8();
+                    }
+                    wrapped.push(remaining[..split_at].to_string());
+                    remaining = &remaining[split_at..];
                 }
                 if !remaining.is_empty() {
                     wrapped.push(remaining.to_string());
@@ -392,6 +409,42 @@ impl Widget for &mut StreamView {
                 buf.set_span(x, y, span, width);
                 x += width;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_content_cjk() {
+        use unicode_width::UnicodeWidthStr;
+        let mut s = StreamView::new();
+        s.width = 80;
+
+        // CJK characters: 3 bytes UTF-8, 2 display columns each
+        let content = "# Step 5: 測試 focus-pane 回到原 pane";
+        let result = s.truncate_content(content, 20);
+
+        for line in result.lines() {
+            let w = UnicodeWidthStr::width(line);
+            assert!(w <= 20, "line exceeds width 20: {:?} (width {})", line, w);
+        }
+    }
+
+    #[test]
+    fn test_truncate_content_emoji() {
+        use unicode_width::UnicodeWidthStr;
+        let mut s = StreamView::new();
+        s.width = 80;
+
+        let content = "Hello 🔧🔧🔧🔧🔧🔧🔧🔧🔧🔧 world";
+        let result = s.truncate_content(content, 15);
+
+        for line in result.lines() {
+            let w = UnicodeWidthStr::width(line);
+            assert!(w <= 15, "line exceeds width 15: {:?} (width {})", line, w);
         }
     }
 }
