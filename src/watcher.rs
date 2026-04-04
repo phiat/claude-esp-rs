@@ -164,6 +164,7 @@ pub struct Watcher {
     watch_active: Arc<AtomicBool>,
     skip_history: Arc<AtomicBool>,
     active_window: Duration,
+    max_sessions: usize,
 
     // fsnotify fields
     use_notify: bool,
@@ -178,7 +179,14 @@ pub struct Watcher {
 impl Watcher {
     /// Create a new watcher, optionally for a specific session.
     /// poll_ms sets the poll interval in milliseconds (0 uses default).
-    pub async fn new(session_id: Option<&str>, poll_ms: u64) -> Result<(Self, WatcherChannels)> {
+    /// active_window controls how recent a session must be to be discovered.
+    /// max_sessions caps the number of sessions (0=unlimited).
+    pub async fn new(
+        session_id: Option<&str>,
+        poll_ms: u64,
+        active_window: Duration,
+        max_sessions: usize,
+    ) -> Result<(Self, WatcherChannels)> {
         let claude_dir = get_claude_projects_dir()?;
 
         let (item_tx, item_rx) = mpsc::channel(ITEM_CHANNEL_BUFFER);
@@ -226,7 +234,12 @@ impl Watcher {
             cancel_token: CancellationToken::new(),
             watch_active,
             skip_history,
-            active_window: Duration::from_secs(ACTIVE_WINDOW_SECS),
+            active_window: if active_window.is_zero() {
+                Duration::from_secs(ACTIVE_WINDOW_SECS)
+            } else {
+                active_window
+            },
+            max_sessions,
             use_notify,
             fs_event_rx: if use_notify {
                 Some(Arc::new(Mutex::new(fs_event_rx)))
@@ -451,8 +464,8 @@ impl Watcher {
         let active_window = self.active_window;
         let claude_dir = self.claude_dir.clone();
 
-        // Collect sessions to add
-        let mut sessions_to_add = Vec::new();
+        // Collect sessions with their modification times for sorting
+        let mut discovered: Vec<(Session, std::time::SystemTime)> = Vec::new();
 
         Self::walk_directory(&claude_dir, &mut |path| {
             if !is_main_session_file(path) {
@@ -467,17 +480,24 @@ impl Watcher {
                             return;
                         }
                     }
+                    if let Ok(session) = self.build_session(path) {
+                        discovered.push((session, modified));
+                    }
                 }
-            }
-
-            if let Ok(session) = self.build_session(path) {
-                sessions_to_add.push(session);
             }
         })?;
 
+        // Sort by most recent first
+        discovered.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Apply max-sessions cap
+        if self.max_sessions > 0 && discovered.len() > self.max_sessions {
+            discovered.truncate(self.max_sessions);
+        }
+
         // Add sessions to the map
         let mut sessions = self.sessions.write().await;
-        for session in sessions_to_add {
+        for (session, _) in discovered {
             sessions.insert(session.id.clone(), Arc::new(session));
         }
 
@@ -890,7 +910,7 @@ impl Watcher {
         let now = std::time::SystemTime::now();
         let claude_dir = self.claude_dir.clone();
 
-        let mut new_sessions = Vec::new();
+        let mut candidates: Vec<(String, PathBuf, std::time::SystemTime)> = Vec::new();
 
         Self::walk_directory(&claude_dir, &mut |path| {
             if !is_main_session_file(path) {
@@ -905,31 +925,40 @@ impl Watcher {
                             return;
                         }
                     }
+
+                    let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let id = basename.trim_end_matches(".jsonl").to_string();
+                    candidates.push((id, path.to_path_buf(), modified));
                 }
             }
-
-            let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let id = basename.trim_end_matches(".jsonl").to_string();
-
-            new_sessions.push((id, path.to_path_buf()));
         })
         .ok();
 
-        for (id, path) in new_sessions {
-            let exists = self.sessions.read().await.contains_key(&id);
-            if !exists {
-                if let Ok(session) = self.build_session(&path) {
-                    let project_path = session.project_path.clone();
-                    self.sessions
-                        .write()
-                        .await
-                        .insert(id.clone(), Arc::new(session));
+        // Sort candidates by most recent first
+        candidates.sort_by(|a, b| b.2.cmp(&a.2));
 
-                    let _ = self.new_session_tx.try_send(NewSessionMsg {
-                        session_id: id,
-                        project_path,
-                    });
-                }
+        for (id, path, _) in candidates {
+            let exists = self.sessions.read().await.contains_key(&id);
+            if exists {
+                continue;
+            }
+
+            // Enforce max-sessions cap
+            if self.max_sessions > 0 && self.sessions.read().await.len() >= self.max_sessions {
+                break;
+            }
+
+            if let Ok(session) = self.build_session(&path) {
+                let project_path = session.project_path.clone();
+                self.sessions
+                    .write()
+                    .await
+                    .insert(id.clone(), Arc::new(session));
+
+                let _ = self.new_session_tx.try_send(NewSessionMsg {
+                    session_id: id,
+                    project_path,
+                });
             }
         }
     }
@@ -1704,7 +1733,9 @@ mod tests {
         fs::create_dir_all(&projects_dir).unwrap();
 
         std::env::set_var("CLAUDE_HOME", dir.path());
-        let (w, _ch) = Watcher::new(None, 100).await.unwrap();
+        let (w, _ch) = Watcher::new(None, 100, Duration::from_secs(ACTIVE_WINDOW_SECS), 0)
+            .await
+            .unwrap();
         std::env::remove_var("CLAUDE_HOME");
 
         // On Linux/macOS, notify should be available
@@ -1722,7 +1753,14 @@ mod tests {
         fs::write(&session_file, "").unwrap();
 
         std::env::set_var("CLAUDE_HOME", dir.path());
-        let (w, mut ch) = Watcher::new(Some("sess001"), 100).await.unwrap();
+        let (w, mut ch) = Watcher::new(
+            Some("sess001"),
+            100,
+            Duration::from_secs(ACTIVE_WINDOW_SECS),
+            0,
+        )
+        .await
+        .unwrap();
         std::env::remove_var("CLAUDE_HOME");
 
         let w = Arc::new(w);
@@ -1763,7 +1801,14 @@ mod tests {
         fs::create_dir_all(&subagent_dir).unwrap();
 
         std::env::set_var("CLAUDE_HOME", dir.path());
-        let (w, mut ch) = Watcher::new(Some("sess002"), 100).await.unwrap();
+        let (w, mut ch) = Watcher::new(
+            Some("sess002"),
+            100,
+            Duration::from_secs(ACTIVE_WINDOW_SECS),
+            0,
+        )
+        .await
+        .unwrap();
         std::env::remove_var("CLAUDE_HOME");
 
         let w = Arc::new(w);
@@ -1796,7 +1841,14 @@ mod tests {
         fs::create_dir_all(&tool_results_dir).unwrap();
 
         std::env::set_var("CLAUDE_HOME", dir.path());
-        let (w, mut ch) = Watcher::new(Some("sess003"), 100).await.unwrap();
+        let (w, mut ch) = Watcher::new(
+            Some("sess003"),
+            100,
+            Duration::from_secs(ACTIVE_WINDOW_SECS),
+            0,
+        )
+        .await
+        .unwrap();
         std::env::remove_var("CLAUDE_HOME");
 
         let w = Arc::new(w);
@@ -1827,7 +1879,14 @@ mod tests {
         fs::write(&session_file, "").unwrap();
 
         std::env::set_var("CLAUDE_HOME", dir.path());
-        let (w, mut ch) = Watcher::new(Some("sess004"), 100).await.unwrap();
+        let (w, mut ch) = Watcher::new(
+            Some("sess004"),
+            100,
+            Duration::from_secs(ACTIVE_WINDOW_SECS),
+            0,
+        )
+        .await
+        .unwrap();
         std::env::remove_var("CLAUDE_HOME");
 
         let w = Arc::new(w);

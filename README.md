@@ -60,15 +60,17 @@ claude-esp-rs
 
 ### Options
 
-| Option     | Description                                   |
-| ---------- | --------------------------------------------- |
-| `-s <ID>`  | Watch a specific session by ID                |
-| `-n`       | Start from newest (skip history, live only)   |
-| `-l`       | List recent sessions                          |
-| `-a`       | List active sessions (modified in last 5 min) |
-| `-p <ms>`  | Poll interval in ms (fallback mode only, default 500) |
-| `-V`       | Show version                                  |
-| `-h`       | Show help                                     |
+| Option       | Description                                   |
+| ------------ | --------------------------------------------- |
+| `-s <ID>`    | Watch a specific session by ID                |
+| `-n`         | Start from newest (skip history, live only)   |
+| `-l`         | List recent sessions                          |
+| `-a`         | List active sessions                          |
+| `-p <ms>`    | Poll interval in ms (fallback mode only, default 500) |
+| `-w <secs>`  | Active window in seconds (default `300` = 5 min) |
+| `-m <N>`     | Max sessions to show in tree (default 0 = unlimited) |
+| `-V`         | Show version                                  |
+| `-h`         | Show help                                     |
 
 ### Environment Variables
 
