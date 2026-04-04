@@ -23,7 +23,7 @@ struct Cli {
     #[arg(short = 'l')]
     list: bool,
 
-    /// List active sessions (modified in last 5 min)
+    /// List active sessions (uses -w window)
     #[arg(short = 'a')]
     active: bool,
 
@@ -34,14 +34,24 @@ struct Cli {
     /// Poll interval in ms, fallback mode only (min 100)
     #[arg(short = 'p', default_value = "500")]
     poll_ms: u64,
+
+    /// Active window in seconds (default 300 = 5 min)
+    #[arg(short = 'w', default_value = "300")]
+    active_window_secs: u64,
+
+    /// Max sessions to show in tree (0=unlimited)
+    #[arg(short = 'm', default_value = "0")]
+    max_sessions: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let active_window = Duration::from_secs(cli.active_window_secs);
+
     if cli.active {
-        return list_active_sessions_cmd();
+        return list_active_sessions_cmd(active_window);
     }
 
     if cli.list {
@@ -52,14 +62,24 @@ async fn main() -> Result<()> {
     let poll_ms = cli.poll_ms.max(100);
 
     // Run TUI
-    run_tui(cli.session.as_deref(), cli.skip_history, poll_ms).await
+    run_tui(
+        cli.session.as_deref(),
+        cli.skip_history,
+        poll_ms,
+        active_window,
+        cli.max_sessions,
+    )
+    .await
 }
 
-fn list_active_sessions_cmd() -> Result<()> {
-    let sessions = list_active_sessions(Duration::from_secs(5 * 60))?;
+fn list_active_sessions_cmd(active_window: Duration) -> Result<()> {
+    let sessions = list_active_sessions(active_window)?;
 
     if sessions.is_empty() {
-        println!("No active sessions (none modified in last 5 minutes)");
+        println!(
+            "No active sessions (none modified in last {}s)",
+            active_window.as_secs()
+        );
         return Ok(());
     }
 
@@ -94,8 +114,15 @@ fn list_sessions_cmd() -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(session_id: Option<&str>, skip_history: bool, poll_ms: u64) -> Result<()> {
-    let (watcher, channels) = Watcher::new(session_id, poll_ms).await?;
+async fn run_tui(
+    session_id: Option<&str>,
+    skip_history: bool,
+    poll_ms: u64,
+    active_window: Duration,
+    max_sessions: usize,
+) -> Result<()> {
+    let (watcher, channels) =
+        Watcher::new(session_id, poll_ms, active_window, max_sessions).await?;
 
     if skip_history {
         watcher.set_skip_history(true);
