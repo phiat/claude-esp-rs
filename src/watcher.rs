@@ -695,6 +695,15 @@ impl Watcher {
             let _ = self.discover_active_sessions().await;
         }
 
+        // Scan for files created before the watch was established.
+        // In-process agents (Agent Teams) create the subagents/ directory and
+        // write .jsonl files nearly simultaneously, so the file CREATE event
+        // fires before the watch is active and gets lost.
+        if path.is_dir() {
+            self.scan_new_directory(path).await;
+            return;
+        }
+
         let path_str = path.to_string_lossy();
 
         // New .jsonl file — session or subagent
@@ -710,6 +719,43 @@ impl Watcher {
         // New .txt in tool-results/ — background task
         if path_str.ends_with(".txt") && path_str.contains("/tool-results/") {
             self.handle_new_tool_result_file(path).await;
+        }
+    }
+
+    /// Scan a newly watched directory for files that may have been created before
+    /// the fsnotify watch was established. This closes the race window where
+    /// in-process agents write files between directory creation and watch setup.
+    /// All discovery handlers are idempotent, so duplicate calls are safe no-ops.
+    async fn scan_new_directory(&self, path: &Path) {
+        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => return,
+        };
+
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                continue;
+            }
+            let name = match entry_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            match dir_name {
+                "subagents" if name.ends_with(".jsonl") => {
+                    self.handle_new_subagent_file(&entry_path).await;
+                }
+                "tool-results" if name.ends_with(".txt") => {
+                    self.handle_new_tool_result_file(&entry_path).await;
+                }
+                _ => {}
+            }
         }
     }
 
