@@ -5,6 +5,7 @@ use ratatui::{
     widgets::Widget,
 };
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthStr;
 
 use super::styles::{self, *};
 use crate::types::{EnabledFilter, AGENT_ID_DISPLAY_LENGTH};
@@ -614,7 +615,7 @@ impl Widget for &TreeView {
             let mut x = area.x;
 
             for span in line.spans.iter() {
-                let width = span.content.chars().count() as u16;
+                let width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
                 if x + width > area.x + area.width {
                     break;
                 }
