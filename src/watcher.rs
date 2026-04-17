@@ -490,7 +490,7 @@ impl Watcher {
         })?;
 
         // Sort by most recent first
-        discovered.sort_by(|a, b| b.1.cmp(&a.1));
+        discovered.sort_by_key(|d| std::cmp::Reverse(d.1));
 
         // Apply max-sessions cap
         if self.max_sessions > 0 && discovered.len() > self.max_sessions {
@@ -983,7 +983,7 @@ impl Watcher {
         .ok();
 
         // Sort candidates by most recent first
-        candidates.sort_by(|a, b| b.2.cmp(&a.2));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
 
         for (id, path, _) in candidates {
             let exists = self.sessions.read().await.contains_key(&id);
@@ -1665,7 +1665,7 @@ fn list_sessions_filtered(limit: usize, active_within: Duration) -> Result<Vec<S
     })?;
 
     // Sort by modification time (most recent first)
-    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
 
     if limit > 0 && sessions.len() > limit {
         sessions.truncate(limit);

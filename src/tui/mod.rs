@@ -240,26 +240,22 @@ impl App {
                 }
             }
 
-            (KeyCode::Char(' '), _) | (KeyCode::Enter, _) => {
-                if self.focus == Focus::Tree {
-                    if let Some(node) = self.tree.get_selected_node() {
-                        if node.node_type == NodeType::BackgroundTask {
-                            self.load_background_task_output();
-                        } else {
-                            self.tree.toggle();
-                            self.stream
-                                .set_enabled_filters(self.tree.get_enabled_filters());
-                        }
+            (KeyCode::Char(' '), _) | (KeyCode::Enter, _) if self.focus == Focus::Tree => {
+                if let Some(node) = self.tree.get_selected_node() {
+                    if node.node_type == NodeType::BackgroundTask {
+                        self.load_background_task_output();
+                    } else {
+                        self.tree.toggle();
+                        self.stream
+                            .set_enabled_filters(self.tree.get_enabled_filters());
                     }
                 }
             }
 
-            (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                if self.focus == Focus::Tree {
-                    self.tree.solo();
-                    self.stream
-                        .set_enabled_filters(self.tree.get_enabled_filters());
-                }
+            (KeyCode::Char('s'), KeyModifiers::NONE) if self.focus == Focus::Tree => {
+                self.tree.solo();
+                self.stream
+                    .set_enabled_filters(self.tree.get_enabled_filters());
             }
 
             (KeyCode::Char('g'), KeyModifiers::NONE) => {
