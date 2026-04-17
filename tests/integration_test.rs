@@ -69,6 +69,9 @@ fn test_real_jsonl_parsing() {
                         StreamItemType::Text => text_count += 1,
                         StreamItemType::ToolInput => tool_input_count += 1,
                         StreamItemType::ToolOutput => tool_output_count += 1,
+                        // TurnMarker / SessionTitle are metadata events; the
+                        // existing counters don't track them.
+                        StreamItemType::TurnMarker | StreamItemType::SessionTitle => {}
                     }
                 }
             }
@@ -85,7 +88,7 @@ fn test_real_jsonl_parsing() {
     println!("Total lines: {}", total);
     println!("Parsed OK: {}", parsed);
     println!("Parse errors: {}", parse_errors);
-    println!("");
+    println!();
     println!("Items found:");
     println!("  Thinking: {}", thinking_count);
     println!("  Text: {}", text_count);

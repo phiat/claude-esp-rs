@@ -206,12 +206,16 @@ impl StreamView {
                     return false;
                 }
 
-                // Check type filter
+                // Check type filter. Turn markers are always shown (dim
+                // divider, no filter key); session-title items are pure
+                // metadata and never render in the stream.
                 match item.item_type {
                     StreamItemType::Thinking => self.show_thinking,
                     StreamItemType::ToolInput => self.show_tool_input,
                     StreamItemType::ToolOutput => self.show_tool_output,
                     StreamItemType::Text => self.show_text,
+                    StreamItemType::TurnMarker => true,
+                    StreamItemType::SessionTitle => false,
                 }
             })
             .cloned()
@@ -234,6 +238,26 @@ impl StreamView {
     }
 
     fn render_item(&mut self, item: &StreamItem, width: usize) {
+        // Turn markers are a standalone single-line divider — no agent header,
+        // no trailing separator. Render and return.
+        if item.item_type == StreamItemType::TurnMarker {
+            let dur = match item.duration_ms {
+                Some(ms) if ms >= 1000 => format!("{:.1}s", ms as f64 / 1000.0),
+                Some(ms) if ms > 0 => format!("{}ms", ms),
+                _ => "?".to_string(),
+            };
+            self.rendered_lines.push(Line::from(Span::styled(
+                format!("── turn ended {} ──", dur),
+                muted_style(),
+            )));
+            return;
+        }
+        // Session-title items never render; they're filtered out above, but
+        // defensively bail anyway.
+        if item.item_type == StreamItemType::SessionTitle {
+            return;
+        }
+
         // Agent name styling
         let agent_style = if item.agent_id.is_empty() {
             main_agent_style()
@@ -243,6 +267,8 @@ impl StreamView {
 
         // Header line with agent name and type
         let (icon, type_name, header_style) = match item.item_type {
+            // Unreachable: TurnMarker/SessionTitle returned early above.
+            StreamItemType::TurnMarker | StreamItemType::SessionTitle => return,
             StreamItemType::Thinking => (
                 THINKING_ICON,
                 " Thinking".to_string(),
@@ -296,6 +322,8 @@ impl StreamView {
             StreamItemType::ToolInput => tool_input_content_style(),
             StreamItemType::ToolOutput => tool_output_content_style(),
             StreamItemType::Text => text_header_style(),
+            // Unreachable: TurnMarker/SessionTitle returned early above.
+            StreamItemType::TurnMarker | StreamItemType::SessionTitle => return,
         };
 
         let truncated = self.truncate_content(&item.content, width);

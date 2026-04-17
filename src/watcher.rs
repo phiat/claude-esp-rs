@@ -328,6 +328,7 @@ impl Watcher {
                         session_id: session.id.clone(),
                         agent_id: String::new(),
                         is_active,
+                        last_modified: chrono::DateTime::<chrono::Utc>::from(modified),
                     });
                 }
             }
@@ -345,6 +346,7 @@ impl Watcher {
                             session_id: session.id.clone(),
                             agent_id: agent_id.clone(),
                             is_active,
+                            last_modified: chrono::DateTime::<chrono::Utc>::from(modified),
                         });
                     }
                 }

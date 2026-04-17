@@ -55,6 +55,9 @@ pub struct App {
     cached_sessions: CachedSessionInfo,
     total_input_tokens: i64,
     total_output_tokens: i64,
+    total_cache_creation: i64,
+    total_cache_read: i64,
+    collapse_after: Option<Duration>,
 
     // Watcher channels
     item_rx: mpsc::Receiver<StreamItem>,
@@ -65,8 +68,13 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new App
-    pub async fn new(watcher: Arc<Watcher>, channels: WatcherChannels) -> Self {
+    /// Create a new App. `collapse_after` controls auto-collapse of idle
+    /// sessions in the tree; `None` disables the feature.
+    pub async fn new(
+        watcher: Arc<Watcher>,
+        channels: WatcherChannels,
+        collapse_after: Option<Duration>,
+    ) -> Self {
         let mut tree = TreeView::new();
 
         // Add existing sessions to tree and cache session info
@@ -112,6 +120,9 @@ impl App {
             cached_sessions,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_creation: 0,
+            total_cache_read: 0,
+            collapse_after,
             item_rx: channels.items,
             new_agent_rx: channels.new_agent,
             new_session_rx: channels.new_session,
@@ -315,6 +326,8 @@ impl App {
                     duration_ms: None,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_creation_tokens: None,
+                    cache_read_tokens: None,
                 };
 
                 self.stream.add_item(item);
@@ -328,13 +341,25 @@ impl App {
 
     async fn poll_watcher(&mut self) {
         // Poll items channel
-        // Token accumulation includes history — shows total session cost
+        // Token accumulation includes history — shows total session cost.
+        // Session-title items update the tree label and are not added to the
+        // stream.
         while let Ok(item) = self.item_rx.try_recv() {
+            if item.item_type == crate::types::StreamItemType::SessionTitle {
+                self.tree.set_session_title(&item.session_id, &item.content);
+                continue;
+            }
             if let Some(t) = item.input_tokens {
                 self.total_input_tokens += t;
             }
             if let Some(t) = item.output_tokens {
                 self.total_output_tokens += t;
+            }
+            if let Some(t) = item.cache_creation_tokens {
+                self.total_cache_creation += t;
+            }
+            if let Some(t) = item.cache_read_tokens {
+                self.total_cache_read += t;
             }
             self.stream.add_item(item);
         }
@@ -378,13 +403,71 @@ impl App {
     }
 
     async fn update_activity(&mut self) {
+        // Gather once so the collapse policy sees the same snapshot as
+        // the activity-flag update.
         let activity = self
             .watcher
             .get_activity_info(Duration::from_secs(30))
             .await;
-        for info in activity {
+        for info in &activity {
             self.tree
                 .update_activity(&info.session_id, &info.agent_id, info.is_active);
+        }
+        if let Some(threshold) = self.collapse_after {
+            self.apply_collapse_policy(&activity, threshold);
+        }
+    }
+
+    /// Auto-collapse idle sessions. A session wakes (newest mod-time within
+    /// 30 s) → any prior user pin is cleared so the next idle cycle will
+    /// re-collapse. This is the "pin resets on wake" semantic.
+    fn apply_collapse_policy(
+        &mut self,
+        activity: &[crate::types::ActivityInfo],
+        threshold: Duration,
+    ) {
+        use std::collections::HashMap;
+        // Newest LastModified across main + all agents per session.
+        let mut latest: HashMap<&str, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        for info in activity {
+            let entry = latest
+                .entry(info.session_id.as_str())
+                .or_insert(info.last_modified);
+            if info.last_modified > *entry {
+                *entry = info.last_modified;
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let awake_window = chrono::Duration::from_std(Duration::from_secs(30)).unwrap();
+        let threshold_chrono = chrono::Duration::from_std(threshold).unwrap();
+
+        // Snapshot session state (id, collapsed, pinned, age) without holding
+        // a mutable borrow across the decide→apply step.
+        let decisions: Vec<(String, bool, bool)> = self
+            .tree
+            .sessions()
+            .iter()
+            .filter(|n| n.node_type == tree::NodeType::Session)
+            .filter_map(|node| {
+                let last = latest.get(node.id.as_str())?;
+                let age = now - *last;
+                let awake = age < awake_window;
+                Some((node.id.clone(), node.collapsed, node.pinned)).map(|(id, c, p)| {
+                    let should_collapse = !c && !p && !awake && age >= threshold_chrono;
+                    let should_unpin = p && awake;
+                    (id, should_collapse, should_unpin)
+                })
+            })
+            .collect();
+
+        for (id, should_collapse, should_unpin) in decisions {
+            if should_unpin {
+                self.tree.set_pinned(&id, false);
+            }
+            if should_collapse {
+                self.tree.set_collapsed(&id, true);
+            }
         }
     }
 
@@ -473,12 +556,27 @@ impl App {
             format!("{} sessions{}", self.cached_sessions.count, auto_disc)
         };
 
-        let token_info = if self.total_input_tokens > 0 || self.total_output_tokens > 0 {
-            format!(
+        // One-line header: in / out, plus cache writes+reads when present.
+        let has_tokens = self.total_input_tokens > 0
+            || self.total_output_tokens > 0
+            || self.total_cache_creation > 0
+            || self.total_cache_read > 0;
+        let token_info = if has_tokens {
+            let base = format!(
                 "  │  {} in / {} out",
                 format_tokens(self.total_input_tokens),
                 format_tokens(self.total_output_tokens)
-            )
+            );
+            if self.total_cache_creation > 0 || self.total_cache_read > 0 {
+                format!(
+                    "{} / {}+{} cache",
+                    base,
+                    format_tokens(self.total_cache_creation),
+                    format_tokens(self.total_cache_read)
+                )
+            } else {
+                base
+            }
         } else {
             String::new()
         };
