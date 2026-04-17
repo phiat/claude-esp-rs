@@ -17,6 +17,10 @@ pub enum StreamItemType {
     ToolInput,
     ToolOutput,
     Text,
+    /// Turn boundary + duration from system.turn_duration JSONL lines.
+    TurnMarker,
+    /// Session label update from agent-name / custom-title JSONL lines.
+    SessionTitle,
 }
 
 /// A single item in the output stream
@@ -33,6 +37,10 @@ pub struct StreamItem {
     pub duration_ms: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    /// usage.cache_creation_input_tokens from assistant messages.
+    pub cache_creation_tokens: Option<i64>,
+    /// usage.cache_read_input_tokens from assistant messages.
+    pub cache_read_tokens: Option<i64>,
 }
 
 /// A background task launched by an agent
@@ -118,4 +126,6 @@ pub struct ActivityInfo {
     pub session_id: String,
     pub agent_id: String,
     pub is_active: bool,
+    /// Last file modification time — drives auto-collapse policy.
+    pub last_modified: DateTime<Utc>,
 }

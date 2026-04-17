@@ -34,6 +34,10 @@ pub struct TreeNode {
     pub parent_agent_id: String,
     pub output_path: Option<PathBuf>,
     pub is_complete: bool,
+    /// Session-only: children hidden from tree navigation AND stream filter.
+    pub collapsed: bool,
+    /// Session-only: user manually expanded — suppress auto-collapse until wake.
+    pub pinned: bool,
 }
 
 impl TreeNode {
@@ -49,6 +53,8 @@ impl TreeNode {
             parent_agent_id: String::new(),
             output_path: None,
             is_complete: false,
+            collapsed: false,
+            pinned: false,
         }
     }
 
@@ -236,19 +242,105 @@ impl TreeView {
         }
     }
 
-    /// Toggle enabled state of current node
+    /// Toggle the current node's visibility.
+    ///
+    /// On a session node, space collapses/expands (hides children in the tree
+    /// and filters them from the stream). Manually expanding pins the session
+    /// so auto-collapse won't re-collapse it until the session wakes again.
+    ///
+    /// On Main/Agent nodes, space still toggles the Enabled flag.
     pub fn toggle(&mut self) {
-        if let Some(node) = self.get_selected_node_mut() {
-            node.enabled = !node.enabled;
-
-            // If toggling a session, toggle all children too
+        let needs_rebuild = if let Some(node) = self.get_selected_node_mut() {
             if node.node_type == NodeType::Session {
-                let enabled = node.enabled;
-                for child in &mut node.children {
-                    child.enabled = enabled;
+                node.collapsed = !node.collapsed;
+                if !node.collapsed {
+                    node.pinned = true;
                 }
+                true
+            } else {
+                node.enabled = !node.enabled;
+                false
+            }
+        } else {
+            false
+        };
+        if needs_rebuild {
+            self.rebuild_flat_list();
+        }
+    }
+
+    /// Update a session's collapse state. When collapsing, move the cursor to
+    /// the session row if it was sitting on a now-hidden child.
+    pub fn set_collapsed(&mut self, session_id: &str, collapsed: bool) {
+        let (sess_idx, was_collapsed) = match self
+            .root
+            .children
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.node_type == NodeType::Session && c.id == session_id)
+        {
+            Some((i, c)) => (i, c.collapsed),
+            None => return,
+        };
+        if was_collapsed == collapsed {
+            return;
+        }
+
+        // Was cursor on a child of this session?
+        let cursor_was_inside_subtree = self
+            .flat_nodes
+            .get(self.cursor)
+            .map(|f| f.node_idx.first() == Some(&sess_idx) && f.node_idx.len() > 1)
+            .unwrap_or(false);
+
+        self.root.children[sess_idx].collapsed = collapsed;
+        self.rebuild_flat_list();
+
+        // Cursor may have landed on now-hidden child; move it to the session row.
+        if collapsed && cursor_was_inside_subtree {
+            if let Some(i) = self
+                .flat_nodes
+                .iter()
+                .position(|f| f.node_idx.as_slice() == [sess_idx])
+            {
+                self.cursor = i;
             }
         }
+    }
+
+    /// Set the user-pinned flag for a session. Pinned sessions are exempt
+    /// from auto-collapse until they next wake up.
+    pub fn set_pinned(&mut self, session_id: &str, pinned: bool) {
+        if let Some(session) = self
+            .root
+            .children
+            .iter_mut()
+            .find(|c| c.node_type == NodeType::Session && c.id == session_id)
+        {
+            session.pinned = pinned;
+        }
+    }
+
+    /// Update a session node's display label. Used to replace the project-
+    /// path fallback when a JSONL `agent-name` or `custom-title` line
+    /// provides a human-readable session title.
+    pub fn set_session_title(&mut self, session_id: &str, title: &str) {
+        if title.is_empty() {
+            return;
+        }
+        if let Some(session) = self
+            .root
+            .children
+            .iter_mut()
+            .find(|c| c.node_type == NodeType::Session && c.id == session_id)
+        {
+            session.name = styles::truncate(title, 25);
+        }
+    }
+
+    /// Read-only access to top-level session nodes (for collapse policy).
+    pub fn sessions(&self) -> &[TreeNode] {
+        &self.root.children
     }
 
     /// Solo the selected node: disable all others, enable only this one.
@@ -271,9 +363,15 @@ impl TreeView {
 
             // Enable the selected node and the path to it
             match selected_path.len() {
-                // Selected a session node — enable it and all children
+                // Selected a session node — enable it and all children.
+                // If collapsed, force-expand + pin so the stream actually
+                // shows its output (the whole point of soloing).
                 1 => {
                     if let Some(session) = self.root.children.get_mut(selected_path[0]) {
+                        if session.collapsed {
+                            session.collapsed = false;
+                            session.pinned = true;
+                        }
                         Self::set_all_enabled(session, true);
                     }
                 }
@@ -380,6 +478,12 @@ impl TreeView {
             _ => {}
         }
 
+        // Collapsed sessions intentionally drop their children from the
+        // stream filter — the whole point is to stop sleeping sessions
+        // from crowding the view.
+        if node.node_type == NodeType::Session && node.collapsed {
+            return;
+        }
         for child in &node.children {
             self.collect_enabled_filters(child, filters);
         }
@@ -466,11 +570,19 @@ impl TreeView {
             node_idx: path.clone(),
         });
 
-        // Get children count without holding a reference
-        let children_len = self
-            .get_node_by_path(&path)
-            .map(|n| n.children.len())
-            .unwrap_or(0);
+        // Collapsed sessions hide their children from navigation AND from
+        // the stream's enabled-filter set (which walks flat_nodes via
+        // collect_enabled_filters through the tree — see below).
+        let (children_len, skip_children) = match self.get_node_by_path(&path) {
+            Some(n) => (
+                n.children.len(),
+                n.node_type == NodeType::Session && n.collapsed,
+            ),
+            None => (0, false),
+        };
+        if skip_children {
+            return;
+        }
 
         for i in 0..children_len {
             let mut child_path = path.clone();
@@ -548,7 +660,16 @@ impl TreeView {
         spans.push(Span::styled(checkbox, check_style));
         spans.push(Span::raw(" "));
 
-        // Icon
+        // Icon. Session nodes additionally carry a ▾/▸ collapse arrow.
+        let session_arrow = if node.node_type == NodeType::Session {
+            if node.collapsed {
+                "▸"
+            } else {
+                "▾"
+            }
+        } else {
+            ""
+        };
         let icon = match node.node_type {
             NodeType::Root => "",
             NodeType::Session => {
@@ -580,9 +701,29 @@ impl TreeView {
                 }
             }
         };
-        spans.push(Span::raw(format!("{} ", icon)));
+        // Session: "📁▾ " / "📂▸ "; others: "💬 " / "🤖 " / etc.
+        if !session_arrow.is_empty() {
+            spans.push(Span::raw(format!("{}{} ", icon, session_arrow)));
+        } else {
+            spans.push(Span::raw(format!("{} ", icon)));
+        }
 
-        // Name
+        // Name. Collapsed sessions append "(+N)" showing hidden agent count
+        // so no information is lost just because the subtree is hidden.
+        let display_name = if node.node_type == NodeType::Session && node.collapsed {
+            let agents = node
+                .children
+                .iter()
+                .filter(|c| c.node_type == NodeType::Agent)
+                .count();
+            if agents > 0 {
+                format!("{} (+{})", node.name, agents)
+            } else {
+                node.name.clone()
+            }
+        } else {
+            node.name.clone()
+        };
         let name_style = if is_selected {
             tree_selected_style()
         } else if !node.is_active && node.node_type != NodeType::Session {
@@ -590,7 +731,7 @@ impl TreeView {
         } else {
             tree_normal_style()
         };
-        spans.push(Span::styled(node.name.clone(), name_style));
+        spans.push(Span::styled(display_name, name_style));
 
         Line::from(spans)
     }
@@ -623,5 +764,78 @@ impl Widget for &TreeView {
                 x += width;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_on_session_collapses_not_disables() {
+        let mut tv = TreeView::new();
+        tv.add_session("s1", "project");
+        tv.add_agent("s1", "agent1", "");
+        tv.cursor = 0; // session row
+
+        tv.toggle();
+        let sess = &tv.root.children[0];
+        assert!(sess.collapsed, "first toggle should collapse");
+        assert!(sess.enabled, "Enabled flag untouched by collapse");
+
+        tv.toggle();
+        let sess = &tv.root.children[0];
+        assert!(!sess.collapsed, "second toggle expands");
+        assert!(sess.pinned, "manual expand pins");
+    }
+
+    #[test]
+    fn collapse_hides_children_from_flatten_and_filters() {
+        let mut tv = TreeView::new();
+        tv.add_session("s1", "project");
+        tv.add_agent("s1", "a1", "");
+        assert_eq!(tv.flat_nodes.len(), 3, "pre-collapse: session+main+agent");
+
+        tv.set_collapsed("s1", true);
+        assert_eq!(tv.flat_nodes.len(), 1, "post-collapse: only session");
+        assert_eq!(
+            tv.get_enabled_filters().len(),
+            0,
+            "collapsed children dropped from filters"
+        );
+    }
+
+    #[test]
+    fn collapse_moves_cursor_out_of_hidden_subtree() {
+        let mut tv = TreeView::new();
+        tv.add_session("s1", "project");
+        tv.add_agent("s1", "a1", "");
+        tv.cursor = 2; // agent row
+
+        tv.set_collapsed("s1", true);
+        assert_eq!(tv.cursor, 0, "cursor should snap to session row");
+    }
+
+    #[test]
+    fn solo_force_expands_collapsed_session() {
+        let mut tv = TreeView::new();
+        tv.add_session("s1", "p1");
+        tv.add_agent("s1", "a1", "");
+        tv.add_session("s2", "p2"); // need 2 sessions so solo isn't a no-op
+        tv.set_collapsed("s1", true);
+        tv.cursor = 0;
+
+        tv.solo();
+        let sess = &tv.root.children[0];
+        assert!(!sess.collapsed, "solo should expand target");
+        assert!(sess.pinned, "solo should pin target");
+    }
+
+    #[test]
+    fn set_session_title_updates_name() {
+        let mut tv = TreeView::new();
+        tv.add_session("s1", "original-name");
+        tv.set_session_title("s1", "human-readable-label");
+        assert_eq!(tv.root.children[0].name, "human-readable-label");
     }
 }

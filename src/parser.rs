@@ -12,13 +12,25 @@ struct RawMessage {
     #[serde(rename = "type")]
     msg_type: String,
     #[serde(default)]
+    subtype: String,
+    #[serde(default)]
     agent_id: String,
+    #[serde(default)]
     session_id: String,
+    #[serde(default)]
     timestamp: String,
+    #[serde(default)]
+    duration_ms: i64,
     #[serde(default)]
     message: Value,
     #[serde(default)]
     tool_use_result: Value,
+    /// type="agent-name" lines: Claude's auto-generated session title.
+    #[serde(default, rename = "agentName")]
+    agent_title: String,
+    /// type="custom-title" lines: user-set session title.
+    #[serde(default, rename = "customTitle")]
+    custom_title: String,
 }
 
 /// Assistant message content
@@ -64,6 +76,35 @@ struct ToolInput {
     prompt: String,
     #[serde(default)]
     query: String,
+    #[serde(default)]
+    skill: String,
+    #[serde(default)]
+    args: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default, rename = "delaySeconds")]
+    delay_seconds: i64,
+    #[serde(default)]
+    subject: String,
+    #[serde(default, rename = "taskId")]
+    task_id_camel: String,
+    #[serde(default)]
+    task_id: String,
+    #[serde(default)]
+    cron: String,
+}
+
+/// Shorten an MCP tool name. `mcp__plugin_context7_context7__query-docs`
+/// becomes `mcp:query-docs` — users know which servers they configured, so
+/// the method name is the only informative part in a narrow tree pane.
+pub fn pretty_tool_name(name: &str) -> String {
+    if !name.starts_with("mcp__") {
+        return name.to_string();
+    }
+    match name.rfind("__") {
+        Some(idx) if idx > 3 && idx + 2 < name.len() => format!("mcp:{}", &name[idx + 2..]),
+        _ => name.to_string(),
+    }
 }
 
 /// Parse a single JSONL line and return stream items
@@ -85,8 +126,14 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
         None => return Ok(vec![]), // Skip lines without type
     };
 
-    // Only process "assistant" and "user" message types
-    if msg_type != "assistant" && msg_type != "user" {
+    // We care about assistant/user (main content), system (turn-duration
+    // markers), and agent-name/custom-title (session-title updates). Other
+    // metadata types are silently dropped.
+    let handled = matches!(
+        msg_type,
+        "assistant" | "user" | "system" | "agent-name" | "custom-title"
+    );
+    if !handled {
         return Ok(vec![]);
     }
 
@@ -103,10 +150,68 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
     let items = match raw.msg_type.as_str() {
         "assistant" => parse_assistant_message(&raw, timestamp),
         "user" => parse_user_message(&raw, timestamp),
+        "system" => parse_system_message(&raw, timestamp),
+        "agent-name" => parse_session_title(&raw, timestamp, &raw.agent_title),
+        "custom-title" => parse_session_title(&raw, timestamp, &raw.custom_title),
         _ => vec![],
     };
 
     Ok(items)
+}
+
+/// Handle system-type JSONL lines. Only surfaces subtype=turn_duration as
+/// a subtle turn-boundary marker; other subtypes are dropped.
+fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+    if raw.subtype != "turn_duration" {
+        return vec![];
+    }
+    let agent_name = if raw.agent_id.is_empty() {
+        "Main".to_string()
+    } else {
+        format!(
+            "Agent-{}",
+            &raw.agent_id[..raw.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
+        )
+    };
+    vec![StreamItem {
+        item_type: StreamItemType::TurnMarker,
+        session_id: raw.session_id.clone(),
+        agent_id: raw.agent_id.clone(),
+        agent_name,
+        timestamp,
+        content: String::new(),
+        tool_name: None,
+        tool_id: None,
+        duration_ms: Some(raw.duration_ms),
+        input_tokens: None,
+        output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+    }]
+}
+
+/// Emit a TypeSessionTitle item carrying a human-readable label for the
+/// session. Both `agent-name` (Claude-generated) and `custom-title`
+/// (user-set) feed through this.
+fn parse_session_title(raw: &RawMessage, timestamp: DateTime<Utc>, title: &str) -> Vec<StreamItem> {
+    if title.is_empty() {
+        return vec![];
+    }
+    vec![StreamItem {
+        item_type: StreamItemType::SessionTitle,
+        session_id: raw.session_id.clone(),
+        agent_id: String::new(),
+        agent_name: String::new(),
+        timestamp,
+        content: title.to_string(),
+        tool_name: None,
+        tool_id: None,
+        duration_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+    }]
 }
 
 fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
@@ -115,16 +220,21 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
         Err(_) => return vec![],
     };
 
-    // Extract token usage from message.usage
-    let input_tokens = raw
-        .message
-        .get("usage")
+    // Extract token usage from message.usage (including cache tokens — with
+    // prompt caching default, cache_creation + cache_read are often the
+    // majority of real usage).
+    let usage = raw.message.get("usage");
+    let input_tokens = usage
         .and_then(|u| u.get("input_tokens"))
         .and_then(|v| v.as_i64());
-    let output_tokens = raw
-        .message
-        .get("usage")
+    let output_tokens = usage
         .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_i64());
+    let cache_creation_tokens = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_i64());
+    let cache_read_tokens = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
         .and_then(|v| v.as_i64());
 
     let agent_name = if raw.agent_id.is_empty() {
@@ -140,12 +250,17 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
     let mut first = true;
 
     for block in msg.content {
-        // Only attach token counts to the first item
-        let (itok, otok) = if first {
+        // Only attach token counts (including cache) to the first item
+        let (itok, otok, ctc, crc) = if first {
             first = false;
-            (input_tokens, output_tokens)
+            (
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            )
         } else {
-            (None, None)
+            (None, None, None, None)
         };
 
         match block.block_type.as_str() {
@@ -162,6 +277,8 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     duration_ms: None,
                     input_tokens: itok,
                     output_tokens: otok,
+                    cache_creation_tokens: ctc,
+                    cache_read_tokens: crc,
                 });
             }
             "text" if !block.text.is_empty() => {
@@ -177,6 +294,8 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     duration_ms: None,
                     input_tokens: itok,
                     output_tokens: otok,
+                    cache_creation_tokens: ctc,
+                    cache_read_tokens: crc,
                 });
             }
             "tool_use" => {
@@ -188,11 +307,13 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     agent_name: agent_name.clone(),
                     timestamp,
                     content,
-                    tool_name: Some(block.name),
+                    tool_name: Some(pretty_tool_name(&block.name)),
                     tool_id: Some(block.id),
                     duration_ms: None,
                     input_tokens: itok,
                     output_tokens: otok,
+                    cache_creation_tokens: ctc,
+                    cache_read_tokens: crc,
                 });
             }
             _ => {}
@@ -252,6 +373,8 @@ fn parse_user_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamI
                             duration_ms,
                             input_tokens: None,
                             output_tokens: None,
+                            cache_creation_tokens: None,
+                            cache_read_tokens: None,
                         });
                     }
                 }
@@ -314,16 +437,45 @@ fn format_tool_input(tool_name: &str, input: &Value) -> String {
         }
         "WebFetch" => input.prompt,
         "WebSearch" => input.query,
-        "Task" => {
-            if !input.prompt.is_empty() {
-                // Truncate long Task prompts
-                if input.prompt.len() > 100 {
-                    format!("{}...", &input.prompt[..100])
-                } else {
-                    input.prompt
-                }
-            } else if !input.description.is_empty() {
+        // "Task" is the legacy name; "Agent" is current (Claude Code 2.x).
+        "Task" | "Agent" => {
+            if !input.description.is_empty() {
                 input.description
+            } else {
+                input.prompt
+            }
+        }
+        "Skill" => {
+            if !input.args.is_empty() {
+                format!("{} — {}", input.skill, input.args)
+            } else {
+                input.skill
+            }
+        }
+        "ToolSearch" => input.query,
+        "ScheduleWakeup" => {
+            if !input.reason.is_empty() {
+                input.reason
+            } else if input.delay_seconds > 0 {
+                format!("delay {}s", input.delay_seconds)
+            } else {
+                String::new()
+            }
+        }
+        "TaskCreate" => input.subject,
+        "TaskUpdate" => {
+            if !input.task_id_camel.is_empty() {
+                format!("task {}", input.task_id_camel)
+            } else {
+                String::new()
+            }
+        }
+        "TaskStop" => input.task_id,
+        "EnterPlanMode" => "(enter plan mode)".to_string(),
+        "ExitPlanMode" => "(exit plan mode)".to_string(),
+        "CronCreate" => {
+            if !input.cron.is_empty() && !input.prompt.is_empty() {
+                format!("{}: {}", input.cron, input.prompt)
             } else {
                 String::new()
             }
@@ -440,5 +592,134 @@ mod tests {
         let result = parse_line(line).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].content, "tool output here");
+    }
+
+    #[test]
+    fn test_pretty_tool_name() {
+        assert_eq!(pretty_tool_name("Bash"), "Bash");
+        assert_eq!(pretty_tool_name("Skill"), "Skill");
+        assert_eq!(
+            pretty_tool_name("mcp__plugin_context7_context7__query-docs"),
+            "mcp:query-docs"
+        );
+        assert_eq!(pretty_tool_name("mcp__context7__resolve"), "mcp:resolve");
+        // No trailing method — pass through unchanged.
+        assert_eq!(pretty_tool_name("mcp__weird"), "mcp__weird");
+    }
+
+    #[test]
+    fn test_format_tool_input_new_tools() {
+        fn fmt(name: &str, input: &str) -> String {
+            let v: Value = serde_json::from_str(input).unwrap();
+            format_tool_input(name, &v)
+        }
+        // Agent (renamed from Task) shows description when available
+        assert_eq!(
+            fmt(
+                "Agent",
+                r#"{"description":"audit deps","prompt":"check all"}"#
+            ),
+            "audit deps"
+        );
+        // Task still works (legacy alias)
+        assert_eq!(
+            fmt("Task", r#"{"description":"legacy task"}"#),
+            "legacy task"
+        );
+        // Skill renders as "<skill> — <args>"
+        assert_eq!(
+            fmt("Skill", r#"{"skill":"beads:create","args":"--title x"}"#),
+            "beads:create — --title x"
+        );
+        assert_eq!(fmt("Skill", r#"{"skill":"beads:list"}"#), "beads:list");
+        assert_eq!(
+            fmt("ToolSearch", r#"{"query":"select:Read","max_results":1}"#),
+            "select:Read"
+        );
+        assert_eq!(
+            fmt(
+                "ScheduleWakeup",
+                r#"{"delaySeconds":90,"reason":"watching build"}"#
+            ),
+            "watching build"
+        );
+        assert_eq!(fmt("ScheduleWakeup", r#"{"delaySeconds":90}"#), "delay 90s");
+        assert_eq!(
+            fmt(
+                "TaskCreate",
+                r#"{"subject":"write docs","activeForm":"writing"}"#
+            ),
+            "write docs"
+        );
+        assert_eq!(
+            fmt("TaskUpdate", r#"{"taskId":"42","status":"in_progress"}"#),
+            "task 42"
+        );
+        assert_eq!(fmt("TaskStop", r#"{"task_id":"abc123"}"#), "abc123");
+        assert_eq!(fmt("EnterPlanMode", r#"{}"#), "(enter plan mode)");
+        assert_eq!(fmt("ExitPlanMode", r#"{}"#), "(exit plan mode)");
+        assert_eq!(
+            fmt(
+                "CronCreate",
+                r#"{"cron":"*/5 * * * *","prompt":"ping","recurring":true}"#
+            ),
+            "*/5 * * * *: ping"
+        );
+    }
+
+    #[test]
+    fn test_parse_cache_tokens() {
+        // cache_creation_input_tokens + cache_read_input_tokens should be
+        // captured alongside input/output_tokens.
+        let line = r#"{"type":"assistant","sessionId":"s","agentId":"","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":35656,"cache_read_input_tokens":1234}}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].input_tokens, Some(10));
+        assert_eq!(items[0].output_tokens, Some(5));
+        assert_eq!(items[0].cache_creation_tokens, Some(35656));
+        assert_eq!(items[0].cache_read_tokens, Some(1234));
+    }
+
+    #[test]
+    fn test_parse_turn_duration() {
+        let line = r#"{"type":"system","subtype":"turn_duration","sessionId":"s","timestamp":"2025-01-01T00:00:00Z","durationMs":41751,"messageCount":42}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::TurnMarker);
+        assert_eq!(items[0].duration_ms, Some(41751));
+    }
+
+    #[test]
+    fn test_parse_system_unknown_subtype_dropped() {
+        // Non-turn_duration system messages are silently dropped.
+        let line = r#"{"type":"system","subtype":"something_else","sessionId":"s","timestamp":"2025-01-01T00:00:00Z"}"#;
+        assert!(parse_line(line).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_agent_name_title() {
+        let line =
+            r#"{"type":"agent-name","agentName":"auto-collapse-feature","sessionId":"sess-1"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionTitle);
+        assert_eq!(items[0].content, "auto-collapse-feature");
+        assert_eq!(items[0].session_id, "sess-1");
+    }
+
+    #[test]
+    fn test_parse_custom_title() {
+        let line = r#"{"type":"custom-title","customTitle":"my-label","sessionId":"sess-2"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "my-label");
+    }
+
+    #[test]
+    fn test_parse_mcp_tool_name_prettified() {
+        let line = r#"{"type":"assistant","sessionId":"s","agentId":"","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__plugin_context7_context7__query-docs","input":{"library":"react"}}]}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name.as_deref(), Some("mcp:query-docs"));
     }
 }

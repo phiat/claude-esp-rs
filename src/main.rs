@@ -42,6 +42,10 @@ struct Cli {
     /// Max sessions to show in tree (0=unlimited)
     #[arg(short = 'm', default_value = "0")]
     max_sessions: usize,
+
+    /// Auto-collapse sessions inactive ≥ N seconds (0=disabled, e.g. 120 for 2 min)
+    #[arg(short = 'c', default_value = "0")]
+    collapse_after_secs: u64,
 }
 
 #[tokio::main]
@@ -61,6 +65,12 @@ async fn main() -> Result<()> {
     // Validate poll interval
     let poll_ms = cli.poll_ms.max(100);
 
+    let collapse_after = if cli.collapse_after_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(cli.collapse_after_secs))
+    };
+
     // Run TUI
     run_tui(
         cli.session.as_deref(),
@@ -68,6 +78,7 @@ async fn main() -> Result<()> {
         poll_ms,
         active_window,
         cli.max_sessions,
+        collapse_after,
     )
     .await
 }
@@ -120,6 +131,7 @@ async fn run_tui(
     poll_ms: u64,
     active_window: Duration,
     max_sessions: usize,
+    collapse_after: Option<Duration>,
 ) -> Result<()> {
     let (watcher, channels) =
         Watcher::new(session_id, poll_ms, active_window, max_sessions).await?;
@@ -129,7 +141,7 @@ async fn run_tui(
     }
 
     let watcher = Arc::new(watcher);
-    let mut app = App::new(watcher, channels).await;
+    let mut app = App::new(watcher, channels, collapse_after).await;
 
     app.run().await
 }
