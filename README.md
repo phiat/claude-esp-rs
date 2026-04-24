@@ -27,7 +27,7 @@ When using Claude Code interactively, tool outputs and thinking are collapsed by
 
 ## Requirements
 
-- Rust 1.74 or later
+- Rust 1.86 or later
 
 ## Installation
 

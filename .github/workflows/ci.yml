@@ -32,6 +32,15 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   cross-compile-check:
     name: Cross-compile check
     runs-on: ubuntu-latest
