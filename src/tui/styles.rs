@@ -14,6 +14,18 @@ pub const TOOL_INPUT_CONTENT: Color = Color::Rgb(252, 211, 77); // #FCD34D
 pub const TOOL_OUTPUT_CONTENT: Color = Color::Rgb(110, 231, 183); // #6EE7B7
 pub const TEXT_CONTENT: Color = Color::Rgb(249, 250, 251); // #F9FAFB
 
+// Hook (cyan) — system-injected output, distinct from tool calls.
+pub const HOOK_HEADER: Color = Color::Rgb(6, 182, 212); // #06B6D4
+pub const HOOK_CONTENT: Color = Color::Rgb(103, 232, 249); // #67E8F9
+
+// Diagnostics (red-ish) — LSP findings after edits.
+pub const DIAGNOSTICS_HEADER: Color = Color::Rgb(248, 113, 113); // #F87171
+pub const DIAGNOSTICS_CONTENT: Color = Color::Rgb(252, 165, 165); // #FCA5A5
+
+// Debug (dim grey) — used by the -D flag.
+pub const DEBUG_HEADER: Color = Color::Rgb(156, 163, 175); // #9CA3AF
+pub const DEBUG_CONTENT: Color = Color::Rgb(156, 163, 175); // #9CA3AF
+
 // Agent colors
 pub const MAIN_AGENT: Color = Color::Rgb(96, 165, 250); // #60A5FA
 pub const SUB_AGENT: Color = Color::Rgb(244, 114, 182); // #F472B6
@@ -28,6 +40,9 @@ pub const THINKING_ICON: &str = "🧠";
 pub const TOOL_INPUT_ICON: &str = "🔧";
 pub const TOOL_OUTPUT_ICON: &str = "📤";
 pub const TEXT_ICON: &str = "💬";
+pub const HOOK_ICON: &str = "🪝";
+pub const DIAGNOSTICS_ICON: &str = "⚠";
+pub const DEBUG_ICON: &str = "🔍";
 
 pub const SESSION_ACTIVE_ICON: &str = "📁";
 pub const SESSION_INACTIVE_ICON: &str = "📂";
@@ -68,6 +83,36 @@ pub fn tool_output_content_style() -> Style {
 
 pub fn text_header_style() -> Style {
     Style::default().fg(TEXT_CONTENT)
+}
+
+pub fn hook_header_style() -> Style {
+    Style::default()
+        .fg(HOOK_HEADER)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn hook_content_style() -> Style {
+    Style::default().fg(HOOK_CONTENT)
+}
+
+pub fn diagnostics_header_style() -> Style {
+    Style::default()
+        .fg(DIAGNOSTICS_HEADER)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn diagnostics_content_style() -> Style {
+    Style::default().fg(DIAGNOSTICS_CONTENT)
+}
+
+pub fn debug_header_style() -> Style {
+    Style::default()
+        .fg(DEBUG_HEADER)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn debug_content_style() -> Style {
+    Style::default().fg(DEBUG_CONTENT)
 }
 
 pub fn main_agent_style() -> Style {

@@ -19,6 +19,17 @@ pub enum StreamItemType {
     Text,
     /// Turn boundary + duration from system.turn_duration JSONL lines.
     TurnMarker,
+    /// Conversation compaction boundary from system.compact_boundary lines.
+    CompactMarker,
+    /// Hook execution result from attachment.hook_success lines.
+    HookOutput,
+    /// Post-edit LSP diagnostics from attachment.diagnostics lines.
+    Diagnostics,
+    /// PR creation event from type=pr-link lines.
+    PRLink,
+    /// Raw type/subtype label for lines the parser would otherwise drop.
+    /// Only emitted when DEBUG_ALL is on.
+    Debug,
     /// Session label update from agent-name / custom-title JSONL lines.
     SessionTitle,
 }
