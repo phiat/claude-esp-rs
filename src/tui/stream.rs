@@ -206,15 +206,21 @@ impl StreamView {
                     return false;
                 }
 
-                // Check type filter. Turn markers are always shown (dim
-                // divider, no filter key); session-title items are pure
+                // Check type filter. Turn/compact/PR markers, hook output,
+                // diagnostics, and debug entries are always shown — they have
+                // no dedicated filter key. Session-title items are pure
                 // metadata and never render in the stream.
                 match item.item_type {
                     StreamItemType::Thinking => self.show_thinking,
                     StreamItemType::ToolInput => self.show_tool_input,
                     StreamItemType::ToolOutput => self.show_tool_output,
                     StreamItemType::Text => self.show_text,
-                    StreamItemType::TurnMarker => true,
+                    StreamItemType::TurnMarker
+                    | StreamItemType::CompactMarker
+                    | StreamItemType::PRLink
+                    | StreamItemType::HookOutput
+                    | StreamItemType::Diagnostics
+                    | StreamItemType::Debug => true,
                     StreamItemType::SessionTitle => false,
                 }
             })
@@ -238,24 +244,40 @@ impl StreamView {
     }
 
     fn render_item(&mut self, item: &StreamItem, width: usize) {
-        // Turn markers are a standalone single-line divider — no agent header,
-        // no trailing separator. Render and return.
-        if item.item_type == StreamItemType::TurnMarker {
-            let dur = match item.duration_ms {
-                Some(ms) if ms >= 1000 => format!("{:.1}s", ms as f64 / 1000.0),
-                Some(ms) if ms > 0 => format!("{}ms", ms),
-                _ => "?".to_string(),
-            };
-            self.rendered_lines.push(Line::from(Span::styled(
-                format!("── turn ended {} ──", dur),
-                muted_style(),
-            )));
-            return;
-        }
-        // Session-title items never render; they're filtered out above, but
-        // defensively bail anyway.
-        if item.item_type == StreamItemType::SessionTitle {
-            return;
+        // Single-line dividers — render and return without agent header /
+        // trailing separator.
+        match item.item_type {
+            StreamItemType::TurnMarker => {
+                let dur = match item.duration_ms {
+                    Some(ms) if ms >= 1000 => format!("{:.1}s", ms as f64 / 1000.0),
+                    Some(ms) if ms > 0 => format!("{}ms", ms),
+                    _ => "?".to_string(),
+                };
+                self.rendered_lines.push(Line::from(Span::styled(
+                    format!("── turn ended {} ──", dur),
+                    muted_style(),
+                )));
+                return;
+            }
+            StreamItemType::CompactMarker => {
+                let text = if item.content.is_empty() {
+                    "── compacted ──".to_string()
+                } else {
+                    format!("── compacted ({}) ──", item.content)
+                };
+                self.rendered_lines
+                    .push(Line::from(Span::styled(text, muted_style())));
+                return;
+            }
+            StreamItemType::PRLink => {
+                self.rendered_lines.push(Line::from(Span::styled(
+                    format!("── {} ──", item.content),
+                    muted_style(),
+                )));
+                return;
+            }
+            StreamItemType::SessionTitle => return,
+            _ => {}
         }
 
         // Agent name styling
@@ -267,8 +289,11 @@ impl StreamView {
 
         // Header line with agent name and type
         let (icon, type_name, header_style) = match item.item_type {
-            // Unreachable: TurnMarker/SessionTitle returned early above.
-            StreamItemType::TurnMarker | StreamItemType::SessionTitle => return,
+            // Unreachable: dividers returned early above.
+            StreamItemType::TurnMarker
+            | StreamItemType::CompactMarker
+            | StreamItemType::PRLink
+            | StreamItemType::SessionTitle => return,
             StreamItemType::Thinking => (
                 THINKING_ICON,
                 " Thinking".to_string(),
@@ -307,6 +332,43 @@ impl StreamView {
                 (TOOL_OUTPUT_ICON, label, tool_output_header_style())
             }
             StreamItemType::Text => (TEXT_ICON, " Response".to_string(), text_header_style()),
+            StreamItemType::HookOutput => {
+                let mut label = " Hook".to_string();
+                if let Some(name) = &item.tool_name {
+                    if !name.is_empty() {
+                        label.push(' ');
+                        label.push_str(name);
+                    }
+                }
+                if let Some(ms) = item.duration_ms {
+                    if ms >= 1000 {
+                        label.push_str(&format!(" ({:.1}s)", ms as f64 / 1000.0));
+                    } else if ms > 0 {
+                        label.push_str(&format!(" ({}ms)", ms));
+                    }
+                }
+                (HOOK_ICON, label, hook_header_style())
+            }
+            StreamItemType::Diagnostics => {
+                let mut label = " Diagnostics".to_string();
+                if let Some(name) = &item.tool_name {
+                    if !name.is_empty() {
+                        label.push(' ');
+                        label.push_str(name);
+                    }
+                }
+                (DIAGNOSTICS_ICON, label, diagnostics_header_style())
+            }
+            StreamItemType::Debug => {
+                let mut label = " Debug".to_string();
+                if let Some(name) = &item.tool_name {
+                    if !name.is_empty() {
+                        label.push(' ');
+                        label.push_str(name);
+                    }
+                }
+                (DEBUG_ICON, label, debug_header_style())
+            }
         };
 
         let header_line = Line::from(vec![
@@ -322,8 +384,14 @@ impl StreamView {
             StreamItemType::ToolInput => tool_input_content_style(),
             StreamItemType::ToolOutput => tool_output_content_style(),
             StreamItemType::Text => text_header_style(),
-            // Unreachable: TurnMarker/SessionTitle returned early above.
-            StreamItemType::TurnMarker | StreamItemType::SessionTitle => return,
+            StreamItemType::HookOutput => hook_content_style(),
+            StreamItemType::Diagnostics => diagnostics_content_style(),
+            StreamItemType::Debug => debug_content_style(),
+            // Unreachable: dividers returned early above.
+            StreamItemType::TurnMarker
+            | StreamItemType::CompactMarker
+            | StreamItemType::PRLink
+            | StreamItemType::SessionTitle => return,
         };
 
         let truncated = self.truncate_content(&item.content, width);

@@ -2,8 +2,30 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::types::{StreamItem, StreamItemType, AGENT_ID_DISPLAY_LENGTH};
+
+/// When `true`, `parse_line` emits a `StreamItemType::Debug` for every line
+/// (or attachment subtype) the parser would otherwise drop. Set once at
+/// startup from a CLI flag; `Relaxed` is fine because we never read it
+/// concurrently with a transition.
+pub static DEBUG_ALL: AtomicBool = AtomicBool::new(false);
+
+/// Cap on the raw-line preview attached to a debug stream item.
+const DEBUG_PREVIEW_LEN: usize = 240;
+
+/// Build "Main" or "Agent-<id>" (truncated) from an agent ID.
+fn agent_display_name(agent_id: &str) -> String {
+    if agent_id.is_empty() {
+        "Main".to_string()
+    } else {
+        format!(
+            "Agent-{}",
+            &agent_id[..agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
+        )
+    }
+}
 
 /// Raw message from JSONL file
 #[derive(Debug, Deserialize)]
@@ -31,6 +53,68 @@ struct RawMessage {
     /// type="custom-title" lines: user-set session title.
     #[serde(default, rename = "customTitle")]
     custom_title: String,
+    /// system.compact_boundary metadata.
+    #[serde(default)]
+    compact_metadata: Option<CompactMetadata>,
+    /// type="attachment" payload.
+    #[serde(default)]
+    attachment: Option<Attachment>,
+    /// type="pr-link" fields.
+    #[serde(default, rename = "prNumber")]
+    pr_number: i64,
+    #[serde(default, rename = "prUrl")]
+    pr_url: String,
+    #[serde(default, rename = "prRepository")]
+    pr_repository: String,
+}
+
+/// Metadata on a system.compact_boundary line.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactMetadata {
+    #[serde(default)]
+    trigger: String,
+    #[serde(default)]
+    pre_tokens: i64,
+}
+
+/// Payload on a type="attachment" line. Subtype-dependent fields share one
+/// struct to avoid per-subtype unmarshalling. `content` is intentionally
+/// omitted because subtypes disagree on its shape (string for hook_success,
+/// array for task_reminder); use `stdout` for hooks.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Attachment {
+    #[serde(rename = "type")]
+    attachment_type: String,
+    #[serde(default)]
+    hook_name: String,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    duration_ms: i64,
+    #[serde(default)]
+    files: Vec<DiagnosticFile>,
+}
+
+/// One file's worth of LSP diagnostics.
+#[derive(Debug, Deserialize)]
+struct DiagnosticFile {
+    #[serde(default)]
+    uri: String,
+    #[serde(default)]
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// A single LSP finding.
+#[derive(Debug, Deserialize)]
+struct Diagnostic {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    source: String,
 }
 
 /// Assistant message content
@@ -126,14 +210,15 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
         None => return Ok(vec![]), // Skip lines without type
     };
 
-    // We care about assistant/user (main content), system (turn-duration
-    // markers), and agent-name/custom-title (session-title updates). Other
-    // metadata types are silently dropped.
+    let debug_all = DEBUG_ALL.load(Ordering::Relaxed);
+
+    // Types we have a parser for. Anything else is dropped (or surfaced as
+    // a Debug item when DEBUG_ALL is on).
     let handled = matches!(
         msg_type,
-        "assistant" | "user" | "system" | "agent-name" | "custom-title"
+        "assistant" | "user" | "system" | "agent-name" | "custom-title" | "attachment" | "pr-link"
     );
-    if !handled {
+    if !handled && !debug_all {
         return Ok(vec![]);
     }
 
@@ -150,44 +235,284 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
     let items = match raw.msg_type.as_str() {
         "assistant" => parse_assistant_message(&raw, timestamp),
         "user" => parse_user_message(&raw, timestamp),
-        "system" => parse_system_message(&raw, timestamp),
+        "system" => {
+            let items = parse_system_message(&raw, timestamp);
+            if debug_all && items.is_empty() {
+                vec![debug_item(&raw, line, timestamp)]
+            } else {
+                items
+            }
+        }
         "agent-name" => parse_session_title(&raw, timestamp, &raw.agent_title),
         "custom-title" => parse_session_title(&raw, timestamp, &raw.custom_title),
-        _ => vec![],
+        "attachment" => {
+            let items = parse_attachment(&raw, timestamp);
+            if debug_all && items.is_empty() {
+                vec![debug_item(&raw, line, timestamp)]
+            } else {
+                items
+            }
+        }
+        "pr-link" => parse_pr_link(&raw, timestamp),
+        _ => {
+            if debug_all {
+                vec![debug_item(&raw, line, timestamp)]
+            } else {
+                vec![]
+            }
+        }
     };
 
     Ok(items)
 }
 
-/// Handle system-type JSONL lines. Only surfaces subtype=turn_duration as
-/// a subtle turn-boundary marker; other subtypes are dropped.
-fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
-    if raw.subtype != "turn_duration" {
-        return vec![];
-    }
-    let agent_name = if raw.agent_id.is_empty() {
-        "Main".to_string()
+/// Build a Debug stream item describing a line that the parser would
+/// otherwise drop. Label is `<type>`, `system:<subtype>`, or
+/// `attachment.<subtype>`. Content is a truncated raw-JSON preview.
+fn debug_item(raw: &RawMessage, line: &str, timestamp: DateTime<Utc>) -> StreamItem {
+    let label = if raw.msg_type == "system" && !raw.subtype.is_empty() {
+        format!("system:{}", raw.subtype)
+    } else if raw.msg_type == "attachment" {
+        match &raw.attachment {
+            Some(a) if !a.attachment_type.is_empty() => {
+                format!("attachment.{}", a.attachment_type)
+            }
+            _ => raw.msg_type.clone(),
+        }
     } else {
-        format!(
-            "Agent-{}",
-            &raw.agent_id[..raw.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
-        )
+        raw.msg_type.clone()
     };
-    vec![StreamItem {
-        item_type: StreamItemType::TurnMarker,
+
+    let preview = if line.len() > DEBUG_PREVIEW_LEN {
+        let mut p = line[..DEBUG_PREVIEW_LEN].to_string();
+        p.push('…');
+        p
+    } else {
+        line.to_string()
+    };
+
+    StreamItem {
+        item_type: StreamItemType::Debug,
         session_id: raw.session_id.clone(),
         agent_id: raw.agent_id.clone(),
-        agent_name,
+        agent_name: agent_display_name(&raw.agent_id),
         timestamp,
-        content: String::new(),
+        content: preview,
+        tool_name: Some(label),
+        tool_id: None,
+        duration_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+    }
+}
+
+/// Dispatch on attachment.type. Surfaces hook_success and diagnostics; every
+/// other subtype is intentionally dropped (DEBUG_ALL surfaces the rest).
+fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+    let att = match &raw.attachment {
+        Some(a) => a,
+        None => return vec![],
+    };
+    let agent_name = agent_display_name(&raw.agent_id);
+
+    match att.attachment_type.as_str() {
+        "hook_success" => vec![StreamItem {
+            item_type: StreamItemType::HookOutput,
+            session_id: raw.session_id.clone(),
+            agent_id: raw.agent_id.clone(),
+            agent_name,
+            timestamp,
+            content: att.stdout.clone(),
+            tool_name: Some(att.hook_name.clone()),
+            tool_id: None,
+            duration_ms: Some(att.duration_ms),
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+        }],
+        "diagnostics" => diagnostics_items(raw, timestamp, &agent_name, att),
+        _ => vec![],
+    }
+}
+
+/// One stream item per file with at least one diagnostic.
+fn diagnostics_items(
+    raw: &RawMessage,
+    timestamp: DateTime<Utc>,
+    agent_name: &str,
+    att: &Attachment,
+) -> Vec<StreamItem> {
+    att.files
+        .iter()
+        .filter(|f| !f.diagnostics.is_empty())
+        .map(|f| StreamItem {
+            item_type: StreamItemType::Diagnostics,
+            session_id: raw.session_id.clone(),
+            agent_id: raw.agent_id.clone(),
+            agent_name: agent_name.to_string(),
+            timestamp,
+            content: diagnostics_body(&f.diagnostics),
+            tool_name: Some(diagnostics_header(f)),
+            tool_id: None,
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+        })
+        .collect()
+}
+
+/// "<basename> (2 errors, 5 hints)"
+fn diagnostics_header(f: &DiagnosticFile) -> String {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for d in &f.diagnostics {
+        *counts.entry(d.severity.to_lowercase()).or_insert(0) += 1;
+    }
+    let mut parts = Vec::new();
+    for sev in ["error", "warning", "info", "hint"] {
+        if let Some(&n) = counts.get(sev) {
+            if n > 0 {
+                let label = if n == 1 {
+                    sev.to_string()
+                } else {
+                    format!("{}s", sev)
+                };
+                parts.push(format!("{} {}", n, label));
+            }
+        }
+    }
+    let name = f.uri.rsplit('/').next().unwrap_or(&f.uri);
+    if parts.is_empty() {
+        name.to_string()
+    } else {
+        format!("{} ({})", name, parts.join(", "))
+    }
+}
+
+/// Each finding rendered "[severity] message (source)".
+fn diagnostics_body(ds: &[Diagnostic]) -> String {
+    ds.iter()
+        .map(|d| {
+            let sev = if d.severity.is_empty() {
+                "?"
+            } else {
+                &d.severity
+            };
+            if d.source.is_empty() {
+                format!("[{}] {}", sev, d.message)
+            } else {
+                format!("[{}] {} ({})", sev, d.message, d.source)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// PR-link marker: "PR #N repo → url"
+fn parse_pr_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+    if raw.pr_number == 0 && raw.pr_url.is_empty() {
+        return vec![];
+    }
+    let content = if !raw.pr_repository.is_empty() && !raw.pr_url.is_empty() {
+        format!(
+            "PR #{} {} → {}",
+            raw.pr_number, raw.pr_repository, raw.pr_url
+        )
+    } else if !raw.pr_url.is_empty() {
+        format!("PR #{} → {}", raw.pr_number, raw.pr_url)
+    } else {
+        format!("PR #{}", raw.pr_number)
+    };
+    vec![StreamItem {
+        item_type: StreamItemType::PRLink,
+        session_id: raw.session_id.clone(),
+        agent_id: String::new(),
+        agent_name: String::new(),
+        timestamp,
+        content,
         tool_name: None,
         tool_id: None,
-        duration_ms: Some(raw.duration_ms),
+        duration_ms: None,
         input_tokens: None,
         output_tokens: None,
         cache_creation_tokens: None,
         cache_read_tokens: None,
     }]
+}
+
+/// Handle system-type JSONL lines. Surfaces:
+///   - subtype=turn_duration → TurnMarker (turn ended + duration)
+///   - subtype=compact_boundary → CompactMarker (auto/manual compaction with
+///     pre-tokens count)
+///
+/// Other subtypes are intentionally dropped.
+fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+    let agent_name = agent_display_name(&raw.agent_id);
+    match raw.subtype.as_str() {
+        "turn_duration" => vec![StreamItem {
+            item_type: StreamItemType::TurnMarker,
+            session_id: raw.session_id.clone(),
+            agent_id: raw.agent_id.clone(),
+            agent_name,
+            timestamp,
+            content: String::new(),
+            tool_name: None,
+            tool_id: None,
+            duration_ms: Some(raw.duration_ms),
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+        }],
+        "compact_boundary" => vec![StreamItem {
+            item_type: StreamItemType::CompactMarker,
+            session_id: raw.session_id.clone(),
+            agent_id: raw.agent_id.clone(),
+            agent_name,
+            timestamp,
+            content: format_compact_summary(raw.compact_metadata.as_ref()),
+            tool_name: None,
+            tool_id: None,
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+        }],
+        _ => vec![],
+    }
+}
+
+/// "auto, 179k pre-tokens" — empty when no metadata.
+fn format_compact_summary(m: Option<&CompactMetadata>) -> String {
+    let m = match m {
+        Some(m) => m,
+        None => return String::new(),
+    };
+    let mut parts = Vec::new();
+    if !m.trigger.is_empty() {
+        parts.push(m.trigger.clone());
+    }
+    if m.pre_tokens > 0 {
+        parts.push(format!("{} pre-tokens", format_token_count(m.pre_tokens)));
+    }
+    parts.join(", ")
+}
+
+/// Render a token count as 1.2k / 179k / 2.3M.
+fn format_token_count(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Emit a TypeSessionTitle item carrying a human-readable label for the
@@ -237,14 +562,7 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
         .and_then(|u| u.get("cache_read_input_tokens"))
         .and_then(|v| v.as_i64());
 
-    let agent_name = if raw.agent_id.is_empty() {
-        "Main".to_string()
-    } else {
-        format!(
-            "Agent-{}",
-            &raw.agent_id[..raw.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
-        )
-    };
+    let agent_name = agent_display_name(&raw.agent_id);
 
     let mut items = Vec::new();
     let mut first = true;
@@ -324,14 +642,7 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
 }
 
 fn parse_user_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
-    let agent_name = if raw.agent_id.is_empty() {
-        "Main".to_string()
-    } else {
-        format!(
-            "Agent-{}",
-            &raw.agent_id[..raw.agent_id.len().min(AGENT_ID_DISPLAY_LENGTH)]
-        )
-    };
+    let agent_name = agent_display_name(&raw.agent_id);
 
     // Extract duration from toolUseResult.durationMs
     let duration_ms = raw
@@ -512,6 +823,8 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_type() {
+        let _g = debug_all_lock();
+        DEBUG_ALL.store(false, Ordering::Relaxed);
         let line = r#"{"type":"file-history-snapshot","sessionId":"abc","timestamp":"2025-01-01T00:00:00Z"}"#;
         let result = parse_line(line).unwrap();
         assert!(result.is_empty());
@@ -691,6 +1004,8 @@ mod tests {
 
     #[test]
     fn test_parse_system_unknown_subtype_dropped() {
+        let _g = debug_all_lock();
+        DEBUG_ALL.store(false, Ordering::Relaxed);
         // Non-turn_duration system messages are silently dropped.
         let line = r#"{"type":"system","subtype":"something_else","sessionId":"s","timestamp":"2025-01-01T00:00:00Z"}"#;
         assert!(parse_line(line).unwrap().is_empty());
@@ -721,5 +1036,130 @@ mod tests {
         let items = parse_line(line).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].tool_name.as_deref(), Some("mcp:query-docs"));
+    }
+
+    #[test]
+    fn test_parse_compact_boundary() {
+        let line = r#"{"type":"system","subtype":"compact_boundary","sessionId":"abc","timestamp":"2025-01-01T12:00:00Z","compactMetadata":{"trigger":"auto","preTokens":179698}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::CompactMarker);
+        assert_eq!(items[0].content, "auto, 179k pre-tokens");
+        assert_eq!(items[0].session_id, "abc");
+    }
+
+    #[test]
+    fn test_parse_compact_boundary_no_metadata() {
+        let line = r#"{"type":"system","subtype":"compact_boundary","sessionId":"abc","timestamp":"2025-01-01T12:00:00Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::CompactMarker);
+        assert_eq!(items[0].content, "");
+    }
+
+    #[test]
+    fn test_parse_hook_success() {
+        let line = r#"{"type":"attachment","sessionId":"abc","timestamp":"2025-01-01T12:00:00Z","attachment":{"type":"hook_success","hookName":"SessionStart:startup","hookEvent":"SessionStart","stdout":"hello\nworld","exitCode":0,"durationMs":116,"command":"bd prime"}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::HookOutput);
+        assert_eq!(items[0].tool_name.as_deref(), Some("SessionStart:startup"));
+        assert_eq!(items[0].duration_ms, Some(116));
+        assert_eq!(items[0].content, "hello\nworld");
+    }
+
+    #[test]
+    fn test_parse_attachment_unknown_subtype_dropped() {
+        let _g = debug_all_lock();
+        DEBUG_ALL.store(false, Ordering::Relaxed);
+        let line = r#"{"type":"attachment","sessionId":"abc","timestamp":"2025-01-01T12:00:00Z","attachment":{"type":"task_reminder","content":[],"itemCount":0}}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_diagnostics() {
+        let line = r#"{"type":"attachment","sessionId":"abc","timestamp":"2025-01-01T12:00:00Z","attachment":{"type":"diagnostics","files":[{"uri":"/path/to/foo.go","diagnostics":[{"message":"unused parameter","severity":"Info","source":"unusedparams"},{"message":"loop can be modernized","severity":"Hint","source":"rangeint"}]}]}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::Diagnostics);
+        assert_eq!(
+            items[0].tool_name.as_deref(),
+            Some("foo.go (1 info, 1 hint)")
+        );
+        assert!(items[0]
+            .content
+            .contains("[Info] unused parameter (unusedparams)"));
+    }
+
+    #[test]
+    fn test_parse_diagnostics_empty_files_skipped() {
+        let line = r#"{"type":"attachment","sessionId":"abc","timestamp":"2025-01-01T12:00:00Z","attachment":{"type":"diagnostics","files":[{"uri":"/x.go","diagnostics":[]}]}}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pr_link() {
+        let line = r#"{"type":"pr-link","sessionId":"abc","prNumber":13,"prUrl":"https://github.com/phiat/claude-esp/pull/13","prRepository":"phiat/claude-esp","timestamp":"2025-01-01T12:00:00Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::PRLink);
+        assert_eq!(
+            items[0].content,
+            "PR #13 phiat/claude-esp → https://github.com/phiat/claude-esp/pull/13"
+        );
+    }
+
+    /// DEBUG_ALL is process-global; serialize the toggle so tests don't race.
+    /// Cargo runs tests in parallel by default — using a mutex here keeps
+    /// tests that flip the flag from corrupting each other.
+    fn debug_all_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn test_parse_debug_all() {
+        let _g = debug_all_lock();
+        DEBUG_ALL.store(true, Ordering::Relaxed);
+
+        let cases = [
+            (
+                r#"{"type":"file-history-snapshot","sessionId":"s","timestamp":"2025-01-01T12:00:00Z"}"#,
+                "file-history-snapshot",
+            ),
+            (
+                r#"{"type":"system","subtype":"foo","sessionId":"s","timestamp":"2025-01-01T12:00:00Z"}"#,
+                "system:foo",
+            ),
+            (
+                r#"{"type":"attachment","sessionId":"s","timestamp":"2025-01-01T12:00:00Z","attachment":{"type":"task_reminder","content":[],"itemCount":0}}"#,
+                "attachment.task_reminder",
+            ),
+        ];
+        for (line, want_label) in cases {
+            let items = parse_line(line).unwrap();
+            assert_eq!(items.len(), 1, "{}", line);
+            assert_eq!(items[0].item_type, StreamItemType::Debug);
+            assert_eq!(items[0].tool_name.as_deref(), Some(want_label));
+        }
+
+        DEBUG_ALL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_parse_debug_all_skips_handled_lines() {
+        let _g = debug_all_lock();
+        DEBUG_ALL.store(true, Ordering::Relaxed);
+
+        // pr-link is handled → exactly one PRLink item, NOT a Debug entry.
+        let line = r#"{"type":"pr-link","sessionId":"s","prNumber":1,"prUrl":"http://x","prRepository":"a/b","timestamp":"2025-01-01T12:00:00Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::PRLink);
+
+        DEBUG_ALL.store(false, Ordering::Relaxed);
     }
 }

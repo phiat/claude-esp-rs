@@ -3,8 +3,10 @@ use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
 
+use claude_esp::parser;
 use claude_esp::tui::App;
 use claude_esp::watcher::{list_active_sessions, list_sessions, Watcher};
+use std::sync::atomic::Ordering;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -46,11 +48,17 @@ struct Cli {
     /// Auto-collapse sessions inactive ≥ N seconds (0=disabled, e.g. 120 for 2 min)
     #[arg(short = 'c', default_value = "0")]
     collapse_after_secs: u64,
+
+    /// Debug: surface raw type:subtype for every JSONL line type the parser would otherwise drop
+    #[arg(short = 'D')]
+    debug_all: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    parser::DEBUG_ALL.store(cli.debug_all, Ordering::Relaxed);
 
     let active_window = Duration::from_secs(cli.active_window_secs);
 
