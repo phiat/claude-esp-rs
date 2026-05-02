@@ -38,6 +38,12 @@ pub struct TreeNode {
     pub collapsed: bool,
     /// Session-only: user manually expanded — suppress auto-collapse until wake.
     pub pinned: bool,
+    /// Main/Agent only: latest snapshot of input + cache_creation + cache_read
+    /// tokens from the most recent assistant message. 0 = not yet observed.
+    pub context_tokens: i64,
+    /// Main/Agent only: max context window (in tokens) for this node's model,
+    /// resolved via parser::context_window_for. 0 = not yet observed.
+    pub context_window: i64,
 }
 
 impl TreeNode {
@@ -55,6 +61,8 @@ impl TreeNode {
             is_complete: false,
             collapsed: false,
             pinned: false,
+            context_tokens: 0,
+            context_window: 0,
         }
     }
 
@@ -489,6 +497,26 @@ impl TreeView {
         }
     }
 
+    /// Update the per-(session, agent) context-size snapshot. Overwrites
+    /// rather than accumulates — context size is a rolling value reported
+    /// fresh by every assistant turn. Empty `agent_id` targets the Main row.
+    pub fn update_context(&mut self, session_id: &str, agent_id: &str, tokens: i64, window: i64) {
+        for child in self.root.children.iter_mut() {
+            if child.node_type != NodeType::Session || child.id != session_id {
+                continue;
+            }
+            for c in child.children.iter_mut() {
+                let is_target = (c.node_type == NodeType::Main && agent_id.is_empty())
+                    || (c.node_type == NodeType::Agent && c.id == agent_id);
+                if is_target {
+                    c.context_tokens = tokens;
+                    c.context_window = window;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Update activity status for a session/agent
     pub fn update_activity(&mut self, session_id: &str, agent_id: &str, is_active: bool) {
         // Find and update the session
@@ -651,15 +679,6 @@ impl TreeView {
             spans.push(Span::raw(branch));
         }
 
-        // Checkbox
-        let (checkbox, check_style) = if node.enabled {
-            (CHECKBOX_CHECKED, tree_checked_style())
-        } else {
-            (CHECKBOX_UNCHECKED, tree_unchecked_style())
-        };
-        spans.push(Span::styled(checkbox, check_style));
-        spans.push(Span::raw(" "));
-
         // Icon. Session nodes additionally carry a ▾/▸ collapse arrow.
         let session_arrow = if node.node_type == NodeType::Session {
             if node.collapsed {
@@ -726,15 +745,37 @@ impl TreeView {
         };
         let name_style = if is_selected {
             tree_selected_style()
-        } else if !node.is_active && node.node_type != NodeType::Session {
+        } else if !node.enabled || (!node.is_active && node.node_type != NodeType::Session) {
             muted_style()
         } else {
             tree_normal_style()
         };
         spans.push(Span::styled(display_name, name_style));
 
+        // Per-(Main/Agent) context size as "<pct>%" — only renders once
+        // we've parsed an assistant message with usage + model info.
+        let suffix = context_suffix(node);
+        if !suffix.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(suffix, muted_style()));
+        }
+
         Line::from(spans)
     }
+}
+
+/// Build "XX%" for Main/Agent nodes once we've recorded a context-size
+/// snapshot. Empty for sessions, background tasks, and any node we
+/// haven't seen an assistant turn for yet.
+fn context_suffix(node: &TreeNode) -> String {
+    if node.node_type != NodeType::Main && node.node_type != NodeType::Agent {
+        return String::new();
+    }
+    if node.context_tokens <= 0 || node.context_window <= 0 {
+        return String::new();
+    }
+    let pct = node.context_tokens.saturating_mul(100) / node.context_window;
+    format!("{}%", pct)
 }
 
 impl Default for TreeView {
@@ -829,6 +870,45 @@ mod tests {
         let sess = &tv.root.children[0];
         assert!(!sess.collapsed, "solo should expand target");
         assert!(sess.pinned, "solo should pin target");
+    }
+
+    #[test]
+    fn update_context_targets_main_and_agent() {
+        let mut tv = TreeView::new();
+        tv.add_session("s1", "p1");
+        tv.add_agent("s1", "a1", "Explore");
+
+        tv.update_context("s1", "", 180_000, 1_000_000);
+        tv.update_context("s1", "a1", 18_000, 200_000);
+
+        let main = tv.root.children[0]
+            .children
+            .iter()
+            .find(|c| c.node_type == NodeType::Main)
+            .unwrap();
+        assert_eq!(main.context_tokens, 180_000);
+        assert_eq!(main.context_window, 1_000_000);
+        assert_eq!(context_suffix(main), "18%");
+
+        let agent = tv.root.children[0]
+            .children
+            .iter()
+            .find(|c| c.node_type == NodeType::Agent)
+            .unwrap();
+        assert_eq!(context_suffix(agent), "9%");
+    }
+
+    #[test]
+    fn context_suffix_empty_until_observed() {
+        let mut tv = TreeView::new();
+        tv.add_session("s1", "p1");
+        let main = tv.root.children[0]
+            .children
+            .iter()
+            .find(|c| c.node_type == NodeType::Main)
+            .unwrap();
+        // No update_context call yet → no suffix.
+        assert_eq!(context_suffix(main), "");
     }
 
     #[test]

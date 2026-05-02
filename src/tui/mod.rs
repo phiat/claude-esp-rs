@@ -112,7 +112,7 @@ impl App {
             watcher,
             focus: Focus::Stream,
             show_tree: true,
-            tree_width: 25,
+            tree_width: 30,
             width: 0,
             height: 0,
             quitting: false,
@@ -324,6 +324,7 @@ impl App {
                     output_tokens: None,
                     cache_creation_tokens: None,
                     cache_read_tokens: None,
+                    model: None,
                 };
 
                 self.stream.add_item(item);
@@ -356,6 +357,22 @@ impl App {
             }
             if let Some(t) = item.cache_read_tokens {
                 self.total_cache_read += t;
+            }
+            // Per-(session, agent) context-size snapshot — overwrites the
+            // previous value because context size is a rolling number, not
+            // a cumulative sum. Only assistant messages carry `model`.
+            if let Some(model) = item.model.as_deref() {
+                let ctx = item.input_tokens.unwrap_or(0)
+                    + item.cache_creation_tokens.unwrap_or(0)
+                    + item.cache_read_tokens.unwrap_or(0);
+                if ctx > 0 {
+                    self.tree.update_context(
+                        &item.session_id,
+                        &item.agent_id,
+                        ctx,
+                        crate::parser::context_window_for(model),
+                    );
+                }
             }
             self.stream.add_item(item);
         }
@@ -594,12 +611,11 @@ impl App {
     }
 
     fn render_toggle(&self, name: &str, enabled: bool, key: &str) -> String {
-        let checkbox = if enabled {
-            CHECKBOX_CHECKED
-        } else {
-            CHECKBOX_UNCHECKED
-        };
-        format!("{} {}[{}]", checkbox, name, key)
+        // Drop the ☑/☐ checkbox column — disabled toggles get a leading
+        // mid-dot marker, enabled toggles a leading space, so the bar's
+        // column widths stay aligned.
+        let marker = if enabled { ' ' } else { '·' };
+        format!("{}{}[{}]", marker, name, key)
     }
 
     fn render_with_tree(&mut self, f: &mut Frame, area: Rect) {

@@ -52,6 +52,11 @@ pub struct StreamItem {
     pub cache_creation_tokens: Option<i64>,
     /// usage.cache_read_input_tokens from assistant messages.
     pub cache_read_tokens: Option<i64>,
+    /// message.model from assistant lines (e.g. "claude-opus-4-7").
+    /// Set only on the first item parsed from each assistant message;
+    /// `<synthetic>` is filtered out. Used to resolve the per-agent
+    /// max context window for the tree's context-size suffix.
+    pub model: Option<String>,
 }
 
 /// A background task launched by an agent

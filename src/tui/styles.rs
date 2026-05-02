@@ -53,9 +53,6 @@ pub const AGENT_INACTIVE_ICON: &str = "💤";
 pub const TASK_COMPLETE_ICON: &str = "✓";
 pub const TASK_RUNNING_ICON: &str = "⏳";
 
-pub const CHECKBOX_CHECKED: &str = "☑";
-pub const CHECKBOX_UNCHECKED: &str = "☐";
-
 // Styles
 pub fn thinking_header_style() -> Style {
     Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD)
@@ -132,14 +129,6 @@ pub fn tree_selected_style() -> Style {
 
 pub fn tree_normal_style() -> Style {
     Style::default().fg(TREE_NORMAL)
-}
-
-pub fn tree_checked_style() -> Style {
-    Style::default().fg(SECONDARY)
-}
-
-pub fn tree_unchecked_style() -> Style {
-    Style::default().fg(MUTED)
 }
 
 pub fn header_style() -> Style {
