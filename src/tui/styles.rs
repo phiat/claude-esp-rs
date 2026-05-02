@@ -53,9 +53,6 @@ pub const AGENT_INACTIVE_ICON: &str = "💤";
 pub const TASK_COMPLETE_ICON: &str = "✓";
 pub const TASK_RUNNING_ICON: &str = "⏳";
 
-pub const CHECKBOX_CHECKED: &str = "☑";
-pub const CHECKBOX_UNCHECKED: &str = "☐";
-
 // Styles
 pub fn thinking_header_style() -> Style {
     Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD)

@@ -611,12 +611,11 @@ impl App {
     }
 
     fn render_toggle(&self, name: &str, enabled: bool, key: &str) -> String {
-        let checkbox = if enabled {
-            CHECKBOX_CHECKED
-        } else {
-            CHECKBOX_UNCHECKED
-        };
-        format!("{} {}[{}]", checkbox, name, key)
+        // Drop the ☑/☐ checkbox column — disabled toggles get a leading
+        // mid-dot marker, enabled toggles a leading space, so the bar's
+        // column widths stay aligned.
+        let marker = if enabled { ' ' } else { '·' };
+        format!("{}{}[{}]", marker, name, key)
     }
 
     fn render_with_tree(&mut self, f: &mut Frame, area: Rect) {
