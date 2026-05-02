@@ -305,6 +305,7 @@ fn debug_item(raw: &RawMessage, line: &str, timestamp: DateTime<Utc>) -> StreamI
         output_tokens: None,
         cache_creation_tokens: None,
         cache_read_tokens: None,
+        model: None,
     }
 }
 
@@ -332,6 +333,7 @@ fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
             output_tokens: None,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            model: None,
         }],
         "diagnostics" => diagnostics_items(raw, timestamp, &agent_name, att),
         _ => vec![],
@@ -362,6 +364,7 @@ fn diagnostics_items(
             output_tokens: None,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            model: None,
         })
         .collect()
 }
@@ -442,6 +445,7 @@ fn parse_pr_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> 
         output_tokens: None,
         cache_creation_tokens: None,
         cache_read_tokens: None,
+        model: None,
     }]
 }
 
@@ -468,6 +472,7 @@ fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<Strea
             output_tokens: None,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            model: None,
         }],
         "compact_boundary" => vec![StreamItem {
             item_type: StreamItemType::CompactMarker,
@@ -483,6 +488,7 @@ fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<Strea
             output_tokens: None,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            model: None,
         }],
         _ => vec![],
     }
@@ -515,6 +521,20 @@ fn format_token_count(n: i64) -> String {
     }
 }
 
+/// Resolve the *max context window* (in tokens) for a model id from
+/// `message.model`. This is the model's hard ceiling — NOT the user's
+/// `autoCompactWindow` setting. Update this table as new models ship;
+/// unknown models fall back to 200k (the conservative current floor).
+pub fn context_window_for(model: &str) -> i64 {
+    if model.starts_with("claude-opus-4-7") || model.starts_with("claude-sonnet-4-6") {
+        return 1_000_000;
+    }
+    if model.starts_with("claude-haiku-4-5") {
+        return 200_000;
+    }
+    200_000
+}
+
 /// Emit a TypeSessionTitle item carrying a human-readable label for the
 /// session. Both `agent-name` (Claude-generated) and `custom-title`
 /// (user-set) feed through this.
@@ -536,6 +556,7 @@ fn parse_session_title(raw: &RawMessage, timestamp: DateTime<Utc>, title: &str) 
         output_tokens: None,
         cache_creation_tokens: None,
         cache_read_tokens: None,
+        model: None,
     }]
 }
 
@@ -562,23 +583,35 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
         .and_then(|u| u.get("cache_read_input_tokens"))
         .and_then(|v| v.as_i64());
 
+    // message.model — used to look up the per-agent max context window.
+    // Filter out "<synthetic>" (Claude Code's placeholder for synthesized
+    // assistant turns); those carry no real model identity.
+    let model = raw
+        .message
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "<synthetic>")
+        .map(|s| s.to_string());
+
     let agent_name = agent_display_name(&raw.agent_id);
 
     let mut items = Vec::new();
     let mut first = true;
 
     for block in msg.content {
-        // Only attach token counts (including cache) to the first item
-        let (itok, otok, ctc, crc) = if first {
+        // Only attach token counts and model to the first item — context
+        // size is a per-message snapshot, not per content-block.
+        let (itok, otok, ctc, crc, mdl) = if first {
             first = false;
             (
                 input_tokens,
                 output_tokens,
                 cache_creation_tokens,
                 cache_read_tokens,
+                model.clone(),
             )
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
 
         match block.block_type.as_str() {
@@ -597,6 +630,7 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     output_tokens: otok,
                     cache_creation_tokens: ctc,
                     cache_read_tokens: crc,
+                    model: mdl,
                 });
             }
             "text" if !block.text.is_empty() => {
@@ -614,6 +648,7 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     output_tokens: otok,
                     cache_creation_tokens: ctc,
                     cache_read_tokens: crc,
+                    model: mdl,
                 });
             }
             "tool_use" => {
@@ -632,6 +667,7 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                     output_tokens: otok,
                     cache_creation_tokens: ctc,
                     cache_read_tokens: crc,
+                    model: mdl,
                 });
             }
             _ => {}
@@ -686,6 +722,7 @@ fn parse_user_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamI
                             output_tokens: None,
                             cache_creation_tokens: None,
                             cache_read_tokens: None,
+                            model: None,
                         });
                     }
                 }
@@ -978,6 +1015,33 @@ mod tests {
             ),
             "*/5 * * * *: ping"
         );
+    }
+
+    #[test]
+    fn test_parse_assistant_model() {
+        // message.model should land on the first item only, with synthetic
+        // placeholders filtered out.
+        let line = r#"{"type":"assistant","sessionId":"s","agentId":"","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"hi"}],"usage":{"input_tokens":10}}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(items[1].model, None, "model only on first item");
+
+        let synthetic = r#"{"type":"assistant","sessionId":"s","agentId":"","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"hi"}]}}"#;
+        let items = parse_line(synthetic).unwrap();
+        assert_eq!(items[0].model, None, "<synthetic> filtered out");
+    }
+
+    #[test]
+    fn test_context_window_for() {
+        assert_eq!(context_window_for("claude-opus-4-7"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-4-7-20260101"), 1_000_000);
+        assert_eq!(context_window_for("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(context_window_for("claude-haiku-4-5"), 200_000);
+        assert_eq!(context_window_for("claude-haiku-4-5-20251001"), 200_000);
+        // Unknown models fall back to the conservative 200k floor.
+        assert_eq!(context_window_for("claude-mystery-9-9"), 200_000);
+        assert_eq!(context_window_for(""), 200_000);
     }
 
     #[test]

@@ -134,14 +134,6 @@ pub fn tree_normal_style() -> Style {
     Style::default().fg(TREE_NORMAL)
 }
 
-pub fn tree_checked_style() -> Style {
-    Style::default().fg(SECONDARY)
-}
-
-pub fn tree_unchecked_style() -> Style {
-    Style::default().fg(MUTED)
-}
-
 pub fn header_style() -> Style {
     Style::default().bg(TREE_SELECTED_BG).fg(TREE_SELECTED_FG)
 }
