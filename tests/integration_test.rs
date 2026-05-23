@@ -77,7 +77,9 @@ fn test_real_jsonl_parsing() {
                         | StreamItemType::Diagnostics
                         | StreamItemType::PRLink
                         | StreamItemType::Debug
-                        | StreamItemType::SessionTitle => {}
+                        | StreamItemType::SessionTitle
+                        | StreamItemType::CacheMiss
+                        | StreamItemType::SessionEvent => {}
                     }
                 }
             }
