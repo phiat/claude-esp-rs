@@ -32,6 +32,11 @@ pub enum StreamItemType {
     Debug,
     /// Session label update from agent-name / custom-title JSONL lines.
     SessionTitle,
+    /// Prompt-cache invalidation from assistant.diagnostics.cache_miss_reason.
+    CacheMiss,
+    /// Misc session-state change (queue-op, plan/auto mode, tool/MCP/skill
+    /// deltas). Rendered as a single muted divider line.
+    SessionEvent,
 }
 
 /// A single item in the output stream

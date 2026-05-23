@@ -66,6 +66,14 @@ struct RawMessage {
     pr_url: String,
     #[serde(default, rename = "prRepository")]
     pr_repository: String,
+    /// Queue-operation fields (type="queue-operation"): "enqueue" or
+    /// "remove", with the queued prompt body in `content`.
+    #[serde(default)]
+    operation: String,
+    /// `content` field on queue-operation lines (renamed to avoid
+    /// collision with other content-shaped fields).
+    #[serde(default, rename = "content")]
+    queue_content: String,
 }
 
 /// Metadata on a system.compact_boundary line.
@@ -95,6 +103,21 @@ struct Attachment {
     duration_ms: i64,
     #[serde(default)]
     files: Vec<DiagnosticFile>,
+    /// plan_mode_exit
+    #[serde(default)]
+    plan_exists: bool,
+    /// deferred_tools_delta and mcp_instructions_delta
+    #[serde(default)]
+    added_names: Vec<String>,
+    #[serde(default)]
+    removed_names: Vec<String>,
+    #[serde(default)]
+    readded_names: Vec<String>,
+    /// skill_listing
+    #[serde(default)]
+    skill_count: i64,
+    #[serde(default)]
+    is_initial: bool,
 }
 
 /// One file's worth of LSP diagnostics.
@@ -216,7 +239,14 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
     // a Debug item when DEBUG_ALL is on).
     let handled = matches!(
         msg_type,
-        "assistant" | "user" | "system" | "agent-name" | "custom-title" | "attachment" | "pr-link"
+        "assistant"
+            | "user"
+            | "system"
+            | "agent-name"
+            | "custom-title"
+            | "attachment"
+            | "pr-link"
+            | "queue-operation"
     );
     if !handled && !debug_all {
         return Ok(vec![]);
@@ -254,6 +284,7 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
             }
         }
         "pr-link" => parse_pr_link(&raw, timestamp),
+        "queue-operation" => parse_queue_operation(&raw, timestamp),
         _ => {
             if debug_all {
                 vec![debug_item(&raw, line, timestamp)]
@@ -336,6 +367,127 @@ fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
             model: None,
         }],
         "diagnostics" => diagnostics_items(raw, timestamp, &agent_name, att),
+        "plan_mode_exit" => vec![session_event(
+            raw,
+            timestamp,
+            &agent_name,
+            "plan mode exit",
+            &plan_mode_exit_detail(att),
+        )],
+        "auto_mode" => vec![session_event(raw, timestamp, &agent_name, "auto mode", "")],
+        "deferred_tools_delta" => {
+            let detail = name_delta_detail(att);
+            if detail.is_empty() {
+                vec![]
+            } else {
+                vec![session_event(raw, timestamp, &agent_name, "tools", &detail)]
+            }
+        }
+        "mcp_instructions_delta" => {
+            let detail = name_delta_detail(att);
+            if detail.is_empty() {
+                vec![]
+            } else {
+                vec![session_event(raw, timestamp, &agent_name, "MCP", &detail)]
+            }
+        }
+        "skill_listing" => {
+            // Initial listing is the session-start bulk dump — drop.
+            // Updates surface as a compact count.
+            if !att.is_initial && att.skill_count > 0 {
+                let detail = format!("{} total", att.skill_count);
+                vec![session_event(
+                    raw,
+                    timestamp,
+                    &agent_name,
+                    "skills",
+                    &detail,
+                )]
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Build a SessionEvent marker. `label` goes in tool_name so the renderer
+/// can render "<label>: <detail>" or just "<label>" when detail is empty.
+fn session_event(
+    raw: &RawMessage,
+    timestamp: DateTime<Utc>,
+    agent_name: &str,
+    label: &str,
+    detail: &str,
+) -> StreamItem {
+    StreamItem {
+        item_type: StreamItemType::SessionEvent,
+        session_id: raw.session_id.clone(),
+        agent_id: raw.agent_id.clone(),
+        agent_name: agent_name.to_string(),
+        timestamp,
+        content: detail.to_string(),
+        tool_name: Some(label.to_string()),
+        tool_id: None,
+        duration_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+        model: None,
+    }
+}
+
+/// Detail for plan_mode_exit. "saved" when the plan was written, otherwise
+/// "" so the marker reads simply "plan mode exit".
+fn plan_mode_exit_detail(att: &Attachment) -> String {
+    if att.plan_exists {
+        "saved".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Summarise added/removed/readded name lists into a compact "+3 -1 ~2"
+/// detail. Returns empty when nothing changed (caller should drop the event).
+fn name_delta_detail(att: &Attachment) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !att.added_names.is_empty() {
+        parts.push(format!("+{}", att.added_names.len()));
+    }
+    if !att.removed_names.is_empty() {
+        parts.push(format!("-{}", att.removed_names.len()));
+    }
+    if !att.readded_names.is_empty() {
+        parts.push(format!("~{}", att.readded_names.len()));
+    }
+    parts.join(" ")
+}
+
+/// Surface top-level type="queue-operation" lines. CC emits these when the
+/// user enqueues a follow-up prompt or removes one from the queue. Enqueues
+/// whose content is a <task-notification> blob are dropped — those are
+/// internal TaskStop result re-injections, not user-typed prompts.
+fn parse_queue_operation(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+    let agent_name = agent_display_name(&raw.agent_id);
+    match raw.operation.as_str() {
+        "enqueue" => {
+            if raw
+                .queue_content
+                .trim_start()
+                .starts_with("<task-notification>")
+            {
+                return vec![];
+            }
+            vec![session_event(
+                raw,
+                timestamp,
+                &agent_name,
+                "queued",
+                &raw.queue_content,
+            )]
+        }
+        "remove" => vec![session_event(raw, timestamp, &agent_name, "dequeued", "")],
         _ => vec![],
     }
 }
@@ -671,6 +823,49 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
                 });
             }
             _ => {}
+        }
+    }
+
+    // Emit a cache-miss marker when the assistant message reports one. This
+    // explains why per-agent context% can spike — e.g. ToolSearch loading a
+    // new tool busts the prompt cache, forcing tens of thousands of input
+    // tokens to be re-sent.
+    if let Some(reason) = raw
+        .message
+        .get("diagnostics")
+        .and_then(|d| d.get("cache_miss_reason"))
+    {
+        let reason_type = reason
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let missed = reason
+            .get("cache_missed_input_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if !reason_type.is_empty() {
+            let detail = if missed > 0 {
+                format!("{}, +{} tokens", reason_type, format_token_count(missed))
+            } else {
+                reason_type
+            };
+            items.push(StreamItem {
+                item_type: StreamItemType::CacheMiss,
+                session_id: raw.session_id.clone(),
+                agent_id: raw.agent_id.clone(),
+                agent_name: agent_name.clone(),
+                timestamp,
+                content: detail,
+                tool_name: None,
+                tool_id: None,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+                model: None,
+            });
         }
     }
 
@@ -1211,6 +1406,125 @@ mod tests {
         }
 
         DEBUG_ALL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_parse_cache_miss_tools_changed() {
+        let line = r#"{"type":"assistant","sessionId":"s","agentId":"","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":6,"output_tokens":5,"cache_creation_input_tokens":58861},"diagnostics":{"cache_miss_reason":{"type":"tools_changed","cache_missed_input_tokens":51402}}}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item_type, StreamItemType::Text);
+        assert_eq!(items[1].item_type, StreamItemType::CacheMiss);
+        assert_eq!(items[1].content, "tools_changed, +51k tokens");
+    }
+
+    #[test]
+    fn test_parse_cache_miss_no_tokens() {
+        let line = r#"{"type":"assistant","sessionId":"s","agentId":"","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"diagnostics":{"cache_miss_reason":{"type":"previous_message_not_found"}}}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].item_type, StreamItemType::CacheMiss);
+        assert_eq!(items[1].content, "previous_message_not_found");
+    }
+
+    #[test]
+    fn test_parse_cache_miss_null_diagnostics_skipped() {
+        let line = r#"{"type":"assistant","sessionId":"s","agentId":"","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1},"diagnostics":null}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::Text);
+    }
+
+    #[test]
+    fn test_parse_queue_op_enqueue() {
+        let line = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","content":"then do a review"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("queued"));
+        assert_eq!(items[0].content, "then do a review");
+    }
+
+    #[test]
+    fn test_parse_queue_op_remove() {
+        let line = r#"{"type":"queue-operation","operation":"remove","timestamp":"2025-01-01T12:00:00Z","sessionId":"s"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name.as_deref(), Some("dequeued"));
+        assert_eq!(items[0].content, "");
+    }
+
+    #[test]
+    fn test_parse_queue_op_task_notification_dropped() {
+        let line = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","content":"<task-notification>\n<task-id>x</task-id>\n</task-notification>"}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_plan_mode_exit_saved() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"plan_mode_exit","planFilePath":"/p.md","planExists":true}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name.as_deref(), Some("plan mode exit"));
+        assert_eq!(items[0].content, "saved");
+    }
+
+    #[test]
+    fn test_parse_plan_mode_exit_unsaved() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"plan_mode_exit","planExists":false}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "");
+    }
+
+    #[test]
+    fn test_parse_auto_mode() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"auto_mode"}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name.as_deref(), Some("auto mode"));
+    }
+
+    #[test]
+    fn test_parse_deferred_tools_delta() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"deferred_tools_delta","addedNames":["A","B","C"],"removedNames":["D"]}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name.as_deref(), Some("tools"));
+        assert_eq!(items[0].content, "+3 -1");
+    }
+
+    #[test]
+    fn test_parse_deferred_tools_delta_empty_dropped() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"deferred_tools_delta","addedNames":[],"removedNames":[]}}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mcp_instructions_delta() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"mcp_instructions_delta","addedNames":["plugin:context7:context7"]}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name.as_deref(), Some("MCP"));
+        assert_eq!(items[0].content, "+1");
+    }
+
+    #[test]
+    fn test_parse_skill_listing_initial_dropped() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"skill_listing","skillCount":49,"isInitial":true}}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_skill_listing_update_surfaces() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"skill_listing","skillCount":50,"isInitial":false}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name.as_deref(), Some("skills"));
+        assert_eq!(items[0].content, "50 total");
     }
 
     #[test]

@@ -16,6 +16,21 @@ pub const MAX_STREAM_ITEMS: usize = 1000;
 /// Maximum lines to display per stream item
 pub const MAX_LINES_PER_ITEM: usize = 50;
 
+/// Collapse whitespace into single spaces and truncate to `max` chars with
+/// trailing ellipsis. Used by single-line markers (cache_miss, session_event)
+/// where the source content may contain newlines or be much longer than the
+/// marker line should be.
+fn one_line_snippet(s: &str, max: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = flat.chars().count();
+    if count <= max {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 /// Stream view widget for displaying items
 pub struct StreamView {
     items: Vec<StreamItem>,
@@ -220,7 +235,9 @@ impl StreamView {
                     | StreamItemType::PRLink
                     | StreamItemType::HookOutput
                     | StreamItemType::Diagnostics
-                    | StreamItemType::Debug => true,
+                    | StreamItemType::Debug
+                    | StreamItemType::CacheMiss
+                    | StreamItemType::SessionEvent => true,
                     StreamItemType::SessionTitle => false,
                 }
             })
@@ -276,6 +293,31 @@ impl StreamView {
                 )));
                 return;
             }
+            StreamItemType::CacheMiss => {
+                let text = if item.content.is_empty() {
+                    "── cache miss ──".to_string()
+                } else {
+                    format!("── cache miss: {} ──", item.content)
+                };
+                self.rendered_lines
+                    .push(Line::from(Span::styled(text, muted_style())));
+                return;
+            }
+            StreamItemType::SessionEvent => {
+                let label = item
+                    .tool_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("event");
+                let text = if item.content.is_empty() {
+                    format!("── {} ──", label)
+                } else {
+                    format!("── {}: {} ──", label, one_line_snippet(&item.content, 80))
+                };
+                self.rendered_lines
+                    .push(Line::from(Span::styled(text, muted_style())));
+                return;
+            }
             StreamItemType::SessionTitle => return,
             _ => {}
         }
@@ -293,6 +335,8 @@ impl StreamView {
             StreamItemType::TurnMarker
             | StreamItemType::CompactMarker
             | StreamItemType::PRLink
+            | StreamItemType::CacheMiss
+            | StreamItemType::SessionEvent
             | StreamItemType::SessionTitle => return,
             StreamItemType::Thinking => (
                 THINKING_ICON,
@@ -391,6 +435,8 @@ impl StreamView {
             StreamItemType::TurnMarker
             | StreamItemType::CompactMarker
             | StreamItemType::PRLink
+            | StreamItemType::CacheMiss
+            | StreamItemType::SessionEvent
             | StreamItemType::SessionTitle => return,
         };
 
