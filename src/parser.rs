@@ -1454,6 +1454,7 @@ mod tests {
 
     #[test]
     fn test_parse_diagnostics_empty_files_skipped() {
+        let _g = debug_all_lock();
         let line = r#"{"type":"attachment","sessionId":"abc","timestamp":"2025-01-01T12:00:00Z","attachment":{"type":"diagnostics","files":[{"uri":"/x.go","diagnostics":[]}]}}"#;
         let items = parse_line(line).unwrap();
         assert!(items.is_empty());
@@ -1557,6 +1558,7 @@ mod tests {
 
     #[test]
     fn test_parse_queue_op_task_notification_dropped() {
+        let _g = debug_all_lock();
         let line = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","content":"<task-notification>\n<task-id>x</task-id>\n</task-notification>"}"#;
         let items = parse_line(line).unwrap();
         assert!(items.is_empty());
@@ -1598,6 +1600,7 @@ mod tests {
 
     #[test]
     fn test_parse_deferred_tools_delta_empty_dropped() {
+        let _g = debug_all_lock();
         let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"deferred_tools_delta","addedNames":[],"removedNames":[]}}"#;
         let items = parse_line(line).unwrap();
         assert!(items.is_empty());
@@ -1614,6 +1617,7 @@ mod tests {
 
     #[test]
     fn test_parse_skill_listing_initial_dropped() {
+        let _g = debug_all_lock();
         let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"skill_listing","skillCount":49,"isInitial":true}}"#;
         let items = parse_line(line).unwrap();
         assert!(items.is_empty());
@@ -1642,6 +1646,7 @@ mod tests {
 
     #[test]
     fn test_parse_ai_title_empty_dropped() {
+        let _g = debug_all_lock();
         let line = r#"{"type":"ai-title","aiTitle":"","sessionId":"sess-3"}"#;
         let items = parse_line(line).unwrap();
         assert!(items.is_empty());
@@ -1686,6 +1691,7 @@ mod tests {
 
     #[test]
     fn test_parse_away_summary_empty_dropped() {
+        let _g = debug_all_lock();
         let line = r#"{"type":"system","subtype":"away_summary","sessionId":"s","timestamp":"2026-06-01T12:00:00Z"}"#;
         let items = parse_line(line).unwrap();
         assert!(items.is_empty());

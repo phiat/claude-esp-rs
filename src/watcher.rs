@@ -1689,6 +1689,18 @@ fn list_sessions_filtered(limit: usize, active_within: Duration) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes CLAUDE_HOME mutation across parallel tokio tests.
+    /// env vars are process-global; without this, one test's remove_var
+    /// can race another test's Watcher::new and point it at the wrong
+    /// (or no) projects dir. tokio Mutex because the guard is held
+    /// across Watcher::new's await.
+    async fn claude_home_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+    }
+
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -1792,11 +1804,13 @@ mod tests {
         let projects_dir = dir.path().join("projects");
         fs::create_dir_all(&projects_dir).unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, _ch) = Watcher::new(None, 100, Duration::from_secs(ACTIVE_WINDOW_SECS), 0)
             .await
             .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         // On Linux/macOS, notify should be available
         assert!(w.using_notify(), "expected notify mode on this platform");
@@ -1812,6 +1826,7 @@ mod tests {
         let session_file = project_dir.join("sess001.jsonl");
         fs::write(&session_file, "").unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess001"),
@@ -1822,6 +1837,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();
@@ -1860,6 +1876,7 @@ mod tests {
         let subagent_dir = project_dir.join("sess002").join("subagents");
         fs::create_dir_all(&subagent_dir).unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess002"),
@@ -1870,6 +1887,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();
@@ -1900,6 +1918,7 @@ mod tests {
         let tool_results_dir = project_dir.join("sess003").join("tool-results");
         fs::create_dir_all(&tool_results_dir).unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess003"),
@@ -1910,6 +1929,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();
@@ -1938,6 +1958,7 @@ mod tests {
         let session_file = project_dir.join("sess004.jsonl");
         fs::write(&session_file, "").unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess004"),
@@ -1948,6 +1969,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();
