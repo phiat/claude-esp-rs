@@ -30,13 +30,18 @@ pub enum StreamItemType {
     /// Raw type/subtype label for lines the parser would otherwise drop.
     /// Only emitted when DEBUG_ALL is on.
     Debug,
-    /// Session label update from agent-name / custom-title JSONL lines.
+    /// Session label update from agent-name / custom-title / ai-title
+    /// JSONL lines.
     SessionTitle,
     /// Prompt-cache invalidation from assistant.diagnostics.cache_miss_reason.
     CacheMiss,
     /// Misc session-state change (queue-op, plan/auto mode, tool/MCP/skill
-    /// deltas). Rendered as a single muted divider line.
+    /// deltas, permission mode, away recap). Rendered as a single muted
+    /// divider line.
     SessionEvent,
+    /// API request failure + retry progress from system.api_error lines.
+    /// Rendered as a single red divider line.
+    ApiError,
 }
 
 /// A single item in the output stream

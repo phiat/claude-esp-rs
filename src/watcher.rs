@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -154,6 +154,8 @@ pub struct Watcher {
     claude_dir: PathBuf,
     poll_interval_ms: u64,
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
+    /// Session IDs removed by the user; never re-discovered.
+    removed: Arc<RwLock<HashSet<String>>>,
     file_positions: Arc<RwLock<HashMap<PathBuf, u64>>>,
     item_tx: mpsc::Sender<StreamItem>,
     new_agent_tx: mpsc::Sender<NewAgentMsg>,
@@ -225,6 +227,7 @@ impl Watcher {
             claude_dir,
             poll_interval_ms,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            removed: Arc::new(RwLock::new(HashSet::new())),
             file_positions: Arc::new(RwLock::new(HashMap::new())),
             item_tx,
             new_agent_tx,
@@ -294,9 +297,11 @@ impl Watcher {
         self.skip_history.store(skip, Ordering::SeqCst);
     }
 
-    /// Remove a session from being watched
+    /// Remove a session from being watched and mark it so auto-discovery
+    /// (polling or fsnotify) doesn't immediately re-add it.
     pub async fn remove_session(&self, session_id: &str) {
         self.sessions.write().await.remove(session_id);
+        self.removed.write().await.insert(session_id.to_string());
     }
 
     /// Toggle auto-discovery of new sessions
@@ -497,9 +502,13 @@ impl Watcher {
             discovered.truncate(self.max_sessions);
         }
 
-        // Add sessions to the map
+        // Add sessions to the map (skipping user-removed IDs)
+        let removed = self.removed.read().await;
         let mut sessions = self.sessions.write().await;
         for (session, _) in discovered {
+            if removed.contains(&session.id) {
+                continue;
+            }
             sessions.insert(session.id.clone(), Arc::new(session));
         }
 
@@ -784,6 +793,9 @@ impl Watcher {
         let id = session.id.clone();
         let project_path = session.project_path.clone();
 
+        if self.removed.read().await.contains(&id) {
+            return;
+        }
         let mut sessions = self.sessions.write().await;
         if sessions.contains_key(&id) {
             return;
@@ -987,7 +999,7 @@ impl Watcher {
 
         for (id, path, _) in candidates {
             let exists = self.sessions.read().await.contains_key(&id);
-            if exists {
+            if exists || self.removed.read().await.contains(&id) {
                 continue;
             }
 
@@ -1677,6 +1689,18 @@ fn list_sessions_filtered(limit: usize, active_within: Duration) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes CLAUDE_HOME mutation across parallel tokio tests.
+    /// env vars are process-global; without this, one test's remove_var
+    /// can race another test's Watcher::new and point it at the wrong
+    /// (or no) projects dir. tokio Mutex because the guard is held
+    /// across Watcher::new's await.
+    async fn claude_home_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+    }
+
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -1780,11 +1804,13 @@ mod tests {
         let projects_dir = dir.path().join("projects");
         fs::create_dir_all(&projects_dir).unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, _ch) = Watcher::new(None, 100, Duration::from_secs(ACTIVE_WINDOW_SECS), 0)
             .await
             .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         // On Linux/macOS, notify should be available
         assert!(w.using_notify(), "expected notify mode on this platform");
@@ -1800,6 +1826,7 @@ mod tests {
         let session_file = project_dir.join("sess001.jsonl");
         fs::write(&session_file, "").unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess001"),
@@ -1810,6 +1837,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();
@@ -1848,6 +1876,7 @@ mod tests {
         let subagent_dir = project_dir.join("sess002").join("subagents");
         fs::create_dir_all(&subagent_dir).unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess002"),
@@ -1858,6 +1887,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();
@@ -1888,6 +1918,7 @@ mod tests {
         let tool_results_dir = project_dir.join("sess003").join("tool-results");
         fs::create_dir_all(&tool_results_dir).unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess003"),
@@ -1898,6 +1929,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();
@@ -1926,6 +1958,7 @@ mod tests {
         let session_file = project_dir.join("sess004.jsonl");
         fs::write(&session_file, "").unwrap();
 
+        let _g = claude_home_guard().await;
         std::env::set_var("CLAUDE_HOME", dir.path());
         let (w, mut ch) = Watcher::new(
             Some("sess004"),
@@ -1936,6 +1969,7 @@ mod tests {
         .await
         .unwrap();
         std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
 
         let w = Arc::new(w);
         w.clone().start();

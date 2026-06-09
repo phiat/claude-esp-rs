@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     buffer::Buffer,
@@ -35,6 +35,7 @@ fn one_line_snippet(s: &str, max: usize) -> String {
 pub struct StreamView {
     items: Vec<StreamItem>,
     seen_tool_ids: HashSet<String>, // dedupe tool input/output by tool_id
+    tool_names: HashMap<String, String>, // tool_id → tool name, for labeling outputs in O(1)
     scroll_offset: usize,
     auto_scroll: bool,
     width: u16,
@@ -59,6 +60,7 @@ impl StreamView {
         Self {
             items: Vec::new(),
             seen_tool_ids: HashSet::new(),
+            tool_names: HashMap::new(),
             scroll_offset: 0,
             auto_scroll: true,
             width: 80,
@@ -93,6 +95,13 @@ impl StreamView {
                     return; // Skip duplicate
                 }
                 self.seen_tool_ids.insert(dedup_key);
+                if item.item_type == StreamItemType::ToolInput {
+                    if let Some(ref name) = item.tool_name {
+                        if !name.is_empty() {
+                            self.tool_names.insert(tool_id.clone(), name.clone());
+                        }
+                    }
+                }
             }
         }
 
@@ -101,9 +110,34 @@ impl StreamView {
         // Keep last MAX_STREAM_ITEMS
         if self.items.len() > MAX_STREAM_ITEMS {
             self.items.drain(0..self.items.len() - MAX_STREAM_ITEMS);
+            self.rebuild_tool_indexes();
         }
 
         self.needs_rerender = true;
+    }
+
+    /// Recreate seen_tool_ids and tool_names from the surviving items after
+    /// truncation. Without this both indexes grow without bound in
+    /// long-running sessions: entries for evicted items are never released.
+    fn rebuild_tool_indexes(&mut self) {
+        self.seen_tool_ids.clear();
+        self.tool_names.clear();
+        for item in &self.items {
+            if let Some(ref tool_id) = item.tool_id {
+                if tool_id.is_empty() {
+                    continue;
+                }
+                self.seen_tool_ids
+                    .insert(format!("{}:{:?}", tool_id, item.item_type));
+                if item.item_type == StreamItemType::ToolInput {
+                    if let Some(ref name) = item.tool_name {
+                        if !name.is_empty() {
+                            self.tool_names.insert(tool_id.clone(), name.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Set enabled session/agent filters
@@ -237,7 +271,8 @@ impl StreamView {
                     | StreamItemType::Diagnostics
                     | StreamItemType::Debug
                     | StreamItemType::CacheMiss
-                    | StreamItemType::SessionEvent => true,
+                    | StreamItemType::SessionEvent
+                    | StreamItemType::ApiError => true,
                     StreamItemType::SessionTitle => false,
                 }
             })
@@ -318,6 +353,16 @@ impl StreamView {
                     .push(Line::from(Span::styled(text, muted_style())));
                 return;
             }
+            StreamItemType::ApiError => {
+                let text = if item.content.is_empty() {
+                    "── API error ──".to_string()
+                } else {
+                    format!("── API error: {} ──", one_line_snippet(&item.content, 80))
+                };
+                self.rendered_lines
+                    .push(Line::from(Span::styled(text, api_error_style())));
+                return;
+            }
             StreamItemType::SessionTitle => return,
             _ => {}
         }
@@ -337,6 +382,7 @@ impl StreamView {
             | StreamItemType::PRLink
             | StreamItemType::CacheMiss
             | StreamItemType::SessionEvent
+            | StreamItemType::ApiError
             | StreamItemType::SessionTitle => return,
             StreamItemType::Thinking => (
                 THINKING_ICON,
@@ -357,18 +403,12 @@ impl StreamView {
                     Some(ms) if ms > 0 => format!(" ({}ms)", ms),
                     _ => String::new(),
                 };
-                // Look up the tool name from the matching ToolInput
-                let tool_name = item.tool_id.as_ref().and_then(|tid| {
-                    self.items.iter().find_map(|i| {
-                        if i.item_type == StreamItemType::ToolInput
-                            && i.tool_id.as_ref() == Some(tid)
-                        {
-                            i.tool_name.clone()
-                        } else {
-                            None
-                        }
-                    })
-                });
+                // Look up the tool name from the matching ToolInput's
+                // index entry (O(1) instead of scanning all items)
+                let tool_name = item
+                    .tool_id
+                    .as_ref()
+                    .and_then(|tid| self.tool_names.get(tid).cloned());
                 let label = match tool_name {
                     Some(name) => format!(" {} result{}", name, duration_str),
                     None => format!(" Output{}", duration_str),
@@ -437,6 +477,7 @@ impl StreamView {
             | StreamItemType::PRLink
             | StreamItemType::CacheMiss
             | StreamItemType::SessionEvent
+            | StreamItemType::ApiError
             | StreamItemType::SessionTitle => return,
         };
 
@@ -558,6 +599,101 @@ impl Widget for &mut StreamView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::StreamItem;
+    use chrono::Utc;
+
+    fn test_item(item_type: StreamItemType, tool_id: &str, tool_name: &str) -> StreamItem {
+        StreamItem {
+            item_type,
+            session_id: "sess1".to_string(),
+            agent_id: String::new(),
+            agent_name: "Main".to_string(),
+            timestamp: Utc::now(),
+            content: "content".to_string(),
+            tool_name: if tool_name.is_empty() {
+                None
+            } else {
+                Some(tool_name.to_string())
+            },
+            tool_id: if tool_id.is_empty() {
+                None
+            } else {
+                Some(tool_id.to_string())
+            },
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn test_tool_indexes_pruned_on_truncation() {
+        let mut s = StreamView::new();
+        // Push well past MAX_STREAM_ITEMS with unique tool IDs; the dedup and
+        // name indexes must track only the surviving items, not grow forever.
+        for i in 0..MAX_STREAM_ITEMS + 500 {
+            s.add_item(test_item(
+                StreamItemType::ToolInput,
+                &format!("tool-{}", i),
+                "Bash",
+            ));
+        }
+        assert_eq!(s.items.len(), MAX_STREAM_ITEMS);
+        assert!(
+            s.seen_tool_ids.len() <= MAX_STREAM_ITEMS,
+            "seen_tool_ids grew unboundedly: {}",
+            s.seen_tool_ids.len()
+        );
+        assert!(
+            s.tool_names.len() <= MAX_STREAM_ITEMS,
+            "tool_names grew unboundedly: {}",
+            s.tool_names.len()
+        );
+    }
+
+    #[test]
+    fn test_tool_output_label_from_index() {
+        let mut s = StreamView::new();
+        s.set_enabled_filters(vec![EnabledFilter {
+            session_id: "sess1".to_string(),
+            agent_id: String::new(),
+        }]);
+        s.add_item(test_item(StreamItemType::ToolInput, "t1", "Bash"));
+        s.add_item(test_item(StreamItemType::ToolOutput, "t1", ""));
+
+        let lines = s.get_visible_lines();
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+        assert!(all.contains("Bash result"), "got: {}", all);
+    }
+
+    #[test]
+    fn test_api_error_marker() {
+        let mut s = StreamView::new();
+        s.set_enabled_filters(vec![EnabledFilter {
+            session_id: "sess1".to_string(),
+            agent_id: String::new(),
+        }]);
+        let mut item = test_item(StreamItemType::ApiError, "", "");
+        item.content = "529 Overloaded, retry 1/10".to_string();
+        s.add_item(item);
+
+        let lines = s.get_visible_lines();
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+        assert!(
+            all.contains("API error: 529 Overloaded, retry 1/10"),
+            "got: {}",
+            all
+        );
+    }
 
     #[test]
     fn test_truncate_content_cjk() {

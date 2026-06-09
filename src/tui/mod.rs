@@ -164,7 +164,7 @@ impl App {
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        self.handle_key(key.code, key.modifiers);
+                        self.handle_key(key.code, key.modifiers).await;
                     }
                     Event::Resize(w, h) => {
                         self.width = w;
@@ -189,7 +189,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+    async fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         match (code, modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quitting = true;
@@ -273,6 +273,18 @@ impl App {
 
             (KeyCode::Char('x'), KeyModifiers::NONE) => {
                 self.stream.toggle_text();
+            }
+
+            (KeyCode::Char('d'), KeyModifiers::NONE) if self.focus == Focus::Tree => {
+                // Remove the selected session from the tree and the watcher.
+                // The watcher remembers the ID so auto-discovery doesn't
+                // re-add it.
+                if let Some(session_id) = self.tree.get_selected_session() {
+                    self.tree.remove_session(&session_id);
+                    self.watcher.remove_session(&session_id).await;
+                    self.stream
+                        .set_enabled_filters(self.tree.get_enabled_filters());
+                }
             }
 
             (KeyCode::Char('A'), KeyModifiers::SHIFT)
@@ -671,7 +683,7 @@ impl App {
 
     fn render_help(&self, f: &mut Frame, area: Rect) {
         let help_text = if self.focus == Focus::Tree {
-            "j/k: navigate │ space: toggle │ s: solo │ A: auto-discover │ q: quit"
+            "j/k: navigate │ space: toggle │ s: solo │ d: remove │ A: auto-discover │ q: quit"
         } else {
             "j/k: scroll │ g/G: top/bottom │ A: auto-discover │ tab: tree │ q: quit"
         };
