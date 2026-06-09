@@ -119,6 +119,7 @@ claude-esp-rs -l
 | `j/k/↑/↓` | Navigate tree or scroll stream            |
 | `space/enter` | On session: collapse/expand (pins on manual expand) · On agent: toggle visibility · On bg task: load output |
 | `s`       | Solo selected session/agent (toggle)      |
+| `d`       | Remove selected session from the tree     |
 | `g/G`     | Go to top/bottom of stream                |
 | `q/Ctrl+c`| Quit                                      |
 

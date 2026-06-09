@@ -47,12 +47,20 @@ struct RawMessage {
     message: Value,
     #[serde(default)]
     tool_use_result: Value,
-    /// type="agent-name" lines: Claude's auto-generated session title.
+    /// type="agent-name" lines: Claude's auto-generated session title
+    /// (legacy spelling; Claude Code now emits ai-title).
     #[serde(default, rename = "agentName")]
     agent_title: String,
     /// type="custom-title" lines: user-set session title.
     #[serde(default, rename = "customTitle")]
     custom_title: String,
+    /// type="ai-title" lines: Claude's auto-generated session title.
+    /// These lines have no timestamp field.
+    #[serde(default, rename = "aiTitle")]
+    ai_title: String,
+    /// type="permission-mode" lines ("default", "auto", ...).
+    #[serde(default, rename = "permissionMode")]
+    permission_mode: String,
     /// system.compact_boundary metadata.
     #[serde(default)]
     compact_metadata: Option<CompactMetadata>,
@@ -71,9 +79,29 @@ struct RawMessage {
     #[serde(default)]
     operation: String,
     /// `content` field on queue-operation lines (renamed to avoid
-    /// collision with other content-shaped fields).
+    /// collision with other content-shaped fields). Also carries the
+    /// recap text on system.away_summary lines.
     #[serde(default, rename = "content")]
     queue_content: String,
+    /// system.api_error fields.
+    #[serde(default)]
+    error: Option<ApiErrorDetail>,
+    #[serde(default)]
+    retry_attempt: i64,
+    #[serde(default)]
+    max_retries: i64,
+}
+
+/// Error payload on system.api_error lines.
+#[derive(Debug, Deserialize)]
+struct ApiErrorDetail {
+    /// Pre-formatted summary, e.g. "529 Overloaded".
+    #[serde(default)]
+    formatted: String,
+    #[serde(default)]
+    status: i64,
+    #[serde(default)]
+    message: String,
 }
 
 /// Metadata on a system.compact_boundary line.
@@ -244,6 +272,8 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
             | "system"
             | "agent-name"
             | "custom-title"
+            | "ai-title"
+            | "permission-mode"
             | "attachment"
             | "pr-link"
             | "queue-operation"
@@ -275,6 +305,21 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
         }
         "agent-name" => parse_session_title(&raw, timestamp, &raw.agent_title),
         "custom-title" => parse_session_title(&raw, timestamp, &raw.custom_title),
+        "ai-title" => parse_session_title(&raw, timestamp, &raw.ai_title),
+        "permission-mode" => {
+            if raw.permission_mode.is_empty() {
+                vec![]
+            } else {
+                let agent_name = agent_display_name(&raw.agent_id);
+                vec![session_event(
+                    &raw,
+                    timestamp,
+                    &agent_name,
+                    "permission mode",
+                    &raw.permission_mode,
+                )]
+            }
+        }
         "attachment" => {
             let items = parse_attachment(&raw, timestamp);
             if debug_all && items.is_empty() {
@@ -605,11 +650,42 @@ fn parse_pr_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> 
 ///   - subtype=turn_duration → TurnMarker (turn ended + duration)
 ///   - subtype=compact_boundary → CompactMarker (auto/manual compaction with
 ///     pre-tokens count)
+///   - subtype=api_error → ApiError (failed API request + retry progress)
+///   - subtype=away_summary → SessionEvent (while-you-were-away recap)
 ///
 /// Other subtypes are intentionally dropped.
 fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
     let agent_name = agent_display_name(&raw.agent_id);
     match raw.subtype.as_str() {
+        "api_error" => vec![StreamItem {
+            item_type: StreamItemType::ApiError,
+            session_id: raw.session_id.clone(),
+            agent_id: raw.agent_id.clone(),
+            agent_name,
+            timestamp,
+            content: format_api_error(raw),
+            tool_name: None,
+            tool_id: None,
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            model: None,
+        }],
+        "away_summary" => {
+            if raw.queue_content.is_empty() {
+                vec![]
+            } else {
+                vec![session_event(
+                    raw,
+                    timestamp,
+                    &agent_name,
+                    "recap",
+                    &raw.queue_content,
+                )]
+            }
+        }
         "turn_duration" => vec![StreamItem {
             item_type: StreamItemType::TurnMarker,
             session_id: raw.session_id.clone(),
@@ -646,6 +722,26 @@ fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<Strea
     }
 }
 
+/// Render a system.api_error line into a short label like
+/// "529 Overloaded, retry 1/10". Falls back to the raw error message (or a
+/// bare status code) when the pre-formatted summary is absent.
+fn format_api_error(raw: &RawMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(e) = &raw.error {
+        if !e.formatted.is_empty() {
+            parts.push(e.formatted.clone());
+        } else if !e.message.is_empty() {
+            parts.push(e.message.clone());
+        } else if e.status != 0 {
+            parts.push(format!("status {}", e.status));
+        }
+    }
+    if raw.retry_attempt > 0 && raw.max_retries > 0 {
+        parts.push(format!("retry {}/{}", raw.retry_attempt, raw.max_retries));
+    }
+    parts.join(", ")
+}
+
 /// "auto, 179k pre-tokens" — empty when no metadata.
 fn format_compact_summary(m: Option<&CompactMetadata>) -> String {
     let m = match m {
@@ -678,7 +774,12 @@ fn format_token_count(n: i64) -> String {
 /// `autoCompactWindow` setting. Update this table as new models ship;
 /// unknown models fall back to 200k (the conservative current floor).
 pub fn context_window_for(model: &str) -> i64 {
-    if model.starts_with("claude-opus-4-7") || model.starts_with("claude-sonnet-4-6") {
+    if model.starts_with("claude-fable-5")
+        || model.starts_with("claude-opus-4-8")
+        || model.starts_with("claude-opus-4-7")
+        || model.starts_with("claude-opus-4-6")
+        || model.starts_with("claude-sonnet-4-6")
+    {
         return 1_000_000;
     }
     if model.starts_with("claude-haiku-4-5") {
@@ -1525,6 +1626,77 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].tool_name.as_deref(), Some("skills"));
         assert_eq!(items[0].content, "50 total");
+    }
+
+    #[test]
+    fn test_parse_ai_title() {
+        // Claude Code renamed agent-name → ai-title; the new lines carry the
+        // label in aiTitle and have no timestamp field.
+        let line = r#"{"type":"ai-title","aiTitle":"Understand pat search functionality","sessionId":"sess-3"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionTitle);
+        assert_eq!(items[0].content, "Understand pat search functionality");
+        assert_eq!(items[0].session_id, "sess-3");
+    }
+
+    #[test]
+    fn test_parse_ai_title_empty_dropped() {
+        let line = r#"{"type":"ai-title","aiTitle":"","sessionId":"sess-3"}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_permission_mode() {
+        let line = r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"s"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("permission mode"));
+        assert_eq!(items[0].content, "auto");
+    }
+
+    #[test]
+    fn test_parse_api_error() {
+        let line = r#"{"type":"system","subtype":"api_error","sessionId":"s","timestamp":"2026-06-01T12:00:00Z","error":{"message":"529 overloaded_error","status":529,"formatted":"529 Overloaded"},"retryInMs":559.6,"retryAttempt":1,"maxRetries":10}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::ApiError);
+        assert_eq!(items[0].content, "529 Overloaded, retry 1/10");
+    }
+
+    #[test]
+    fn test_parse_api_error_message_fallback() {
+        let line = r#"{"type":"system","subtype":"api_error","sessionId":"s","timestamp":"2026-06-01T12:00:00Z","error":{"message":"connection reset"}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "connection reset");
+    }
+
+    #[test]
+    fn test_parse_away_summary() {
+        let line = r#"{"type":"system","subtype":"away_summary","sessionId":"s","timestamp":"2026-06-01T12:00:00Z","content":"Built the thing. Next: ship it."}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("recap"));
+        assert_eq!(items[0].content, "Built the thing. Next: ship it.");
+    }
+
+    #[test]
+    fn test_parse_away_summary_empty_dropped() {
+        let line = r#"{"type":"system","subtype":"away_summary","sessionId":"s","timestamp":"2026-06-01T12:00:00Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_context_window_for_new_models() {
+        assert_eq!(context_window_for("claude-fable-5"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-4-8"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-4-6"), 1_000_000);
+        assert_eq!(context_window_for("claude-sonnet-4-5"), 200_000);
     }
 
     #[test]

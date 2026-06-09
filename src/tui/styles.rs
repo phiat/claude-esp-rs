@@ -147,6 +147,11 @@ pub fn muted_style() -> Style {
     Style::default().fg(MUTED)
 }
 
+/// API error marker - red, so failed/retrying requests stand out.
+pub fn api_error_style() -> Style {
+    Style::default().fg(ERROR)
+}
+
 pub fn border_style() -> Style {
     Style::default().fg(MUTED)
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -154,6 +154,8 @@ pub struct Watcher {
     claude_dir: PathBuf,
     poll_interval_ms: u64,
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
+    /// Session IDs removed by the user; never re-discovered.
+    removed: Arc<RwLock<HashSet<String>>>,
     file_positions: Arc<RwLock<HashMap<PathBuf, u64>>>,
     item_tx: mpsc::Sender<StreamItem>,
     new_agent_tx: mpsc::Sender<NewAgentMsg>,
@@ -225,6 +227,7 @@ impl Watcher {
             claude_dir,
             poll_interval_ms,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            removed: Arc::new(RwLock::new(HashSet::new())),
             file_positions: Arc::new(RwLock::new(HashMap::new())),
             item_tx,
             new_agent_tx,
@@ -294,9 +297,11 @@ impl Watcher {
         self.skip_history.store(skip, Ordering::SeqCst);
     }
 
-    /// Remove a session from being watched
+    /// Remove a session from being watched and mark it so auto-discovery
+    /// (polling or fsnotify) doesn't immediately re-add it.
     pub async fn remove_session(&self, session_id: &str) {
         self.sessions.write().await.remove(session_id);
+        self.removed.write().await.insert(session_id.to_string());
     }
 
     /// Toggle auto-discovery of new sessions
@@ -497,9 +502,13 @@ impl Watcher {
             discovered.truncate(self.max_sessions);
         }
 
-        // Add sessions to the map
+        // Add sessions to the map (skipping user-removed IDs)
+        let removed = self.removed.read().await;
         let mut sessions = self.sessions.write().await;
         for (session, _) in discovered {
+            if removed.contains(&session.id) {
+                continue;
+            }
             sessions.insert(session.id.clone(), Arc::new(session));
         }
 
@@ -784,6 +793,9 @@ impl Watcher {
         let id = session.id.clone();
         let project_path = session.project_path.clone();
 
+        if self.removed.read().await.contains(&id) {
+            return;
+        }
         let mut sessions = self.sessions.write().await;
         if sessions.contains_key(&id) {
             return;
@@ -987,7 +999,7 @@ impl Watcher {
 
         for (id, path, _) in candidates {
             let exists = self.sessions.read().await.contains_key(&id);
-            if exists {
+            if exists || self.removed.read().await.contains(&id) {
                 continue;
             }
 
