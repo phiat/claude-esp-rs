@@ -83,6 +83,9 @@ struct RawMessage {
     /// recap text on system.away_summary lines.
     #[serde(default, rename = "content")]
     queue_content: String,
+    /// Severity on system.informational lines ("info", "warning").
+    #[serde(default)]
+    level: String,
     /// system.api_error fields.
     #[serde(default)]
     error: Option<ApiErrorDetail>,
@@ -652,6 +655,9 @@ fn parse_pr_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> 
 ///     pre-tokens count)
 ///   - subtype=api_error → ApiError (failed API request + retry progress)
 ///   - subtype=away_summary → SessionEvent (while-you-were-away recap)
+///   - subtype=local_command → SessionEvent (slash command invoked)
+///   - subtype=informational → SessionEvent (transient notice, e.g. backgrounding)
+///   - subtype=agents_killed → SessionEvent (subagents terminated)
 ///
 /// Other subtypes are intentionally dropped.
 fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
@@ -718,7 +724,74 @@ fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<Strea
             cache_read_tokens: None,
             model: None,
         }],
+        "local_command" => match local_command_detail(&raw.queue_content) {
+            Some(detail) => vec![session_event(
+                raw,
+                timestamp,
+                &agent_name,
+                "command",
+                &detail,
+            )],
+            None => vec![],
+        },
+        "informational" => {
+            if raw.queue_content.is_empty() {
+                vec![]
+            } else {
+                vec![session_event(
+                    raw,
+                    timestamp,
+                    &agent_name,
+                    informational_label(&raw.level),
+                    &raw.queue_content,
+                )]
+            }
+        }
+        "agents_killed" => vec![session_event(
+            raw,
+            timestamp,
+            &agent_name,
+            "agents killed",
+            "",
+        )],
         _ => vec![],
+    }
+}
+
+/// Render a system.local_command body into "/name args". The body is an
+/// XML-ish blob: `<command-name>/skills</command-name>`
+/// `<command-message>…</command-message><command-args>…</command-args>`.
+fn local_command_detail(content: &str) -> Option<String> {
+    let name = xml_tag_value(content, "command-name")?;
+    match xml_tag_value(content, "command-args") {
+        Some(args) => Some(format!("{name} {args}")),
+        None => Some(name.to_string()),
+    }
+}
+
+/// Map a system.informational level to a stream label. Unknown or absent
+/// levels read simply "note".
+fn informational_label(level: &str) -> &'static str {
+    if level.eq_ignore_ascii_case("warning") {
+        "warning"
+    } else {
+        "note"
+    }
+}
+
+/// Extract the trimmed text between `<tag>` and `</tag>`. Returns `None` when
+/// the tag is absent or its contents are empty.
+fn xml_tag_value<'a>(content: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = content.find(&open)? + open.len();
+    let rest = &content[start..];
+    let end = rest.find(&close)?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
     }
 }
 
@@ -775,6 +848,9 @@ fn format_token_count(n: i64) -> String {
 /// unknown models fall back to 200k (the conservative current floor).
 pub fn context_window_for(model: &str) -> i64 {
     if model.starts_with("claude-fable-5")
+        || model.starts_with("claude-mythos-5")
+        || model.starts_with("claude-opus-5")
+        || model.starts_with("claude-sonnet-5")
         || model.starts_with("claude-opus-4-8")
         || model.starts_with("claude-opus-4-7")
         || model.starts_with("claude-opus-4-6")
@@ -1700,9 +1776,72 @@ mod tests {
     #[test]
     fn test_context_window_for_new_models() {
         assert_eq!(context_window_for("claude-fable-5"), 1_000_000);
+        assert_eq!(context_window_for("claude-mythos-5"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-5"), 1_000_000);
+        assert_eq!(context_window_for("claude-sonnet-5"), 1_000_000);
         assert_eq!(context_window_for("claude-opus-4-8"), 1_000_000);
         assert_eq!(context_window_for("claude-opus-4-6"), 1_000_000);
         assert_eq!(context_window_for("claude-sonnet-4-5"), 200_000);
+    }
+
+    #[test]
+    fn test_parse_local_command() {
+        let line = r#"{"type":"system","subtype":"local_command","sessionId":"s","timestamp":"2026-07-18T17:03:31Z","content":"<command-name>/skills</command-name>\n            <command-message>skills</command-message>\n            <command-args></command-args>"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("command"));
+        assert_eq!(items[0].content, "/skills");
+    }
+
+    #[test]
+    fn test_parse_local_command_with_args() {
+        let line = r#"{"type":"system","subtype":"local_command","sessionId":"s","timestamp":"2026-07-18T17:03:31Z","content":"<command-name>/loop</command-name><command-args>5m check ci</command-args>"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "/loop 5m check ci");
+    }
+
+    #[test]
+    fn test_parse_local_command_no_name_dropped() {
+        let _g = debug_all_lock();
+        let line = r#"{"type":"system","subtype":"local_command","sessionId":"s","timestamp":"2026-07-18T17:03:31Z","content":"no tags here"}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_informational() {
+        for (level, want) in [("warning", "warning"), ("info", "note"), ("", "note")] {
+            let line = format!(
+                r#"{{"type":"system","subtype":"informational","sessionId":"s","timestamp":"2026-08-03T13:34:23Z","content":"Backgrounding after the current tool finishes","level":"{level}"}}"#
+            );
+            let items = parse_line(&line).unwrap();
+            assert_eq!(items.len(), 1, "level {level}");
+            assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+            assert_eq!(items[0].tool_name.as_deref(), Some(want), "level {level}");
+            assert_eq!(
+                items[0].content,
+                "Backgrounding after the current tool finishes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_informational_empty_dropped() {
+        let _g = debug_all_lock();
+        let line = r#"{"type":"system","subtype":"informational","sessionId":"s","timestamp":"2026-08-03T13:34:23Z","level":"warning"}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_agents_killed() {
+        let line = r#"{"type":"system","subtype":"agents_killed","sessionId":"s","timestamp":"2026-08-01T15:22:11Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("agents killed"));
     }
 
     #[test]
