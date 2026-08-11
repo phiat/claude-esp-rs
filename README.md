@@ -213,7 +213,7 @@ claude-esp-rs/
 
 ## Development
 
-Built with [Ratatui](https://github.com/ratatui/ratatui) and [Tokio](https://tokio.rs/). Issue tracking was done with [beads](https://github.com/steveyegge/beads).
+Built with [Ratatui](https://github.com/ratatui/ratatui) and [Tokio](https://tokio.rs/).
 
 ```bash
 # Run tests

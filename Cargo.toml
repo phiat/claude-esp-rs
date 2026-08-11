@@ -10,7 +10,7 @@ homepage = "https://github.com/phiat/claude-esp-rs"
 readme = "README.md"
 keywords = ["claude", "tui", "terminal", "ai", "llm"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".beads/", ".github/", "AGENTS.md", "docs/"]
+exclude = [".github/", "AGENTS.md", "docs/"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
