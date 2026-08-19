@@ -1,4 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // Colors matching Go version
 pub const PRIMARY: Color = Color::Rgb(124, 58, 237); // #7C3AED Purple
@@ -160,13 +161,87 @@ pub fn focused_border_style() -> Style {
     Style::default().fg(PRIMARY)
 }
 
-/// Truncate a string to max length, adding "..." if truncated
+/// Truncate a string to `max` terminal columns, adding "..." if truncated.
+///
+/// Width is measured with unicode-width (same basis as the stream pane's
+/// wrapping) and cuts always land on a char boundary, so multi-byte text
+/// such as CJK session titles never splits mid-character.
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max <= 3 {
-        s[..max].to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    let ellipsis = max > 3;
+    let budget = if ellipsis { max - 3 } else { max };
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if ellipsis {
+        out.push_str("...");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn test_truncate_ascii() {
+        assert_eq!(truncate("short", 25), "short");
+        assert_eq!(truncate("0123456789abcdef", 10), "0123456...");
+        assert_eq!(truncate("0123456789", 3), "012");
+    }
+
+    #[test]
+    fn test_truncate_cjk_session_title_fits() {
+        // 26 bytes but only 22 display columns (14 ASCII + 4 CJK x 2). Byte
+        // slicing both mis-measured this as over-long and panicked cutting it.
+        let title = "Claude-esp-rs 安裝確認";
+        assert_eq!(truncate(title, 25), title);
+    }
+
+    #[test]
+    fn test_truncate_cjk_session_title_overflows() {
+        let title = "Claude-esp-rs 安裝確認與完整操作方式";
+        let result = truncate(title, 25);
+
+        assert!(
+            UnicodeWidthStr::width(result.as_str()) <= 25,
+            "exceeds width 25: {:?}",
+            result
+        );
+        assert!(result.ends_with("..."), "got: {:?}", result);
+    }
+
+    #[test]
+    fn test_truncate_cjk_never_splits_char() {
+        let title = "測試中文標題截斷行為不要壞掉";
+        for max in 0..=40 {
+            let result = truncate(title, max);
+            assert!(
+                UnicodeWidthStr::width(result.as_str()) <= max.max(3),
+                "max {}: {:?}",
+                max,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate_emoji() {
+        let result = truncate("Hello 🔧🔧🔧🔧🔧🔧 world", 15);
+        assert!(
+            UnicodeWidthStr::width(result.as_str()) <= 15,
+            "exceeds width 15: {:?}",
+            result
+        );
     }
 }
