@@ -13,6 +13,7 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::parser;
+use crate::tui::styles::truncate;
 use crate::types::{
     ActivityInfo, BackgroundTask, NewAgentMsg, NewBackgroundTaskMsg, NewSessionMsg, Session,
     SessionInfo, StreamItem, AGENT_ID_DISPLAY_LENGTH,
@@ -1194,21 +1195,13 @@ impl Watcher {
         match tool_name {
             "Bash" => {
                 if let Some(cmd) = Self::extract_field(line, "command") {
-                    let cmd = if cmd.len() > 30 {
-                        format!("{}...", &cmd[..30])
-                    } else {
-                        cmd
-                    };
+                    let cmd = truncate(&cmd, 33);
                     return format!("Bash: {}", cmd);
                 }
             }
             "Task" => {
                 if let Some(desc) = Self::extract_field(line, "description") {
-                    let desc = if desc.len() > 30 {
-                        format!("{}...", &desc[..30])
-                    } else {
-                        desc
-                    };
+                    let desc = truncate(&desc, 33);
                     return format!("Task: {}", desc);
                 }
             }
