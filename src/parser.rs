@@ -1557,10 +1557,34 @@ mod tests {
     /// DEBUG_ALL is process-global; serialize the toggle so tests don't race.
     /// Cargo runs tests in parallel by default — using a mutex here keeps
     /// tests that flip the flag from corrupting each other.
-    fn debug_all_lock() -> std::sync::MutexGuard<'static, ()> {
+    ///
+    /// The guard establishes the invariant that DEBUG_ALL is false when the
+    /// lock is acquired and false again when it is released, including while
+    /// unwinding. Most `*_dropped` tests assert on the flag being off without
+    /// setting it, so a test that turns it on must not be able to leak that
+    /// into whichever test runs next.
+    ///
+    /// Poisoning is deliberately ignored: a failing test should report its own
+    /// assertion, not cascade into PoisonError for everything after it.
+    struct DebugAllGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for DebugAllGuard {
+        fn drop(&mut self) {
+            DEBUG_ALL.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn debug_all_lock() -> DebugAllGuard {
         use std::sync::{Mutex, OnceLock};
         static M: OnceLock<Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| Mutex::new(())).lock().unwrap()
+        let guard = M
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        DEBUG_ALL.store(false, Ordering::Relaxed);
+        DebugAllGuard { _guard: guard }
     }
 
     #[test]
