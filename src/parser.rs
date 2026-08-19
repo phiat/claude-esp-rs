@@ -363,7 +363,13 @@ fn debug_item(raw: &RawMessage, line: &str, timestamp: DateTime<Utc>) -> StreamI
     };
 
     let preview = if line.len() > DEBUG_PREVIEW_LEN {
-        let mut p = line[..DEBUG_PREVIEW_LEN].to_string();
+        // Back off to a char boundary: the raw line is unescaped UTF-8, so a
+        // multi-byte character can straddle DEBUG_PREVIEW_LEN.
+        let mut end = DEBUG_PREVIEW_LEN;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut p = line[..end].to_string();
         p.push('…');
         p
     } else {
@@ -1555,6 +1561,32 @@ mod tests {
         use std::sync::{Mutex, OnceLock};
         static M: OnceLock<Mutex<()>> = OnceLock::new();
         M.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn test_parse_debug_all_preview_cjk_never_splits_char() {
+        let _g = debug_all_lock();
+        DEBUG_ALL.store(true, Ordering::Relaxed);
+
+        // Claude Code writes non-ASCII to the transcript unescaped, so a
+        // multi-byte character can straddle the preview cut. Sweep the pad
+        // length so the boundary lands inside a character from every offset.
+        for pad in 0..16 {
+            let filler = "x".repeat(pad);
+            let line = format!(
+                r#"{{"type":"file-history-snapshot","sessionId":"s","timestamp":"2025-01-01T12:00:00Z","note":"{}{}"}}"#,
+                filler,
+                "\u{6e2c}\u{8a66}\u{4e2d}\u{6587}".repeat(30)
+            );
+            let items = parse_line(&line).unwrap();
+            assert_eq!(items.len(), 1, "pad {pad}");
+            assert_eq!(items[0].item_type, StreamItemType::Debug);
+            assert!(
+                items[0].content.ends_with('\u{2026}'),
+                "pad {pad}: {:?}",
+                items[0].content
+            );
+        }
     }
 
     #[test]
