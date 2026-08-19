@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claude_esp::parser;
+use claude_esp::tui::styles::truncate;
 use claude_esp::tui::App;
 use claude_esp::watcher::{list_active_sessions, list_sessions, Watcher};
 use std::sync::atomic::Ordering;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -154,12 +156,69 @@ async fn run_tui(
     app.run().await
 }
 
+/// Truncate a path to `max` terminal columns, keeping the tail and prefixing
+/// "..." if truncated.
+///
+/// Like `styles::truncate`, this measures with unicode-width and cuts on char
+/// boundaries. Project paths are ASCII today because Claude Code encodes them
+/// into directory names, but the byte slicing this replaces would panic the
+/// moment a non-ASCII path reached it.
 fn truncate_path(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max <= 3 {
-        s[..max].to_string()
-    } else {
-        format!("...{}", &s[s.len() - max + 3..])
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    if max <= 3 {
+        // Same head-cut behavior as before, without the byte slicing.
+        return truncate(s, max);
+    }
+    // Keep the tail — the rightmost path segments carry the information.
+    let budget = max - 3;
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in s.chars().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        kept.push(ch);
+        used += w;
+    }
+    format!("...{}", kept.chars().rev().collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_path;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn test_truncate_path_ascii() {
+        assert_eq!(truncate_path("/short/path", 30), "/short/path");
+
+        let full = "/very/long/path/that/exceeds/the/budget";
+        let result = truncate_path(full, 20);
+        assert!(
+            UnicodeWidthStr::width(result.as_str()) <= 20,
+            "got: {result:?}"
+        );
+        assert!(result.starts_with("..."), "got: {result:?}");
+        assert!(
+            full.ends_with(&result[3..]),
+            "not a tail of the input: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_path_cjk_never_splits_char() {
+        // Byte slicing panicked here, and the tail cut made it worse by
+        // landing inside a character from the other direction.
+        let path = "/Users/me/Documents/創世紀元網站專案";
+        for max in 0..=50 {
+            let result = truncate_path(path, max);
+            assert!(
+                UnicodeWidthStr::width(result.as_str()) <= max.max(3),
+                "max {max}: {result:?}"
+            );
+        }
     }
 }
