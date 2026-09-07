@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::types::{StreamItem, StreamItemType, AGENT_ID_DISPLAY_LENGTH};
@@ -93,6 +94,37 @@ struct RawMessage {
     retry_attempt: i64,
     #[serde(default)]
     max_retries: i64,
+    /// type="frame-link" fields. Only the first line for an artifact
+    /// carries the URL and title; follow-ups carry just `artifact_count`.
+    #[serde(default)]
+    frame_url: String,
+    #[serde(default)]
+    title: String,
+    /// type="continued-in": the successor session id.
+    #[serde(default)]
+    continued_in_session_id: String,
+    /// type="cost-state" fields, written at session end. The line has no
+    /// timestamp; `start_time + total_duration` (both ms) reconstructs it.
+    #[serde(default, rename = "totalCostUSD")]
+    total_cost_usd: f64,
+    #[serde(default)]
+    total_lines_added: i64,
+    #[serde(default)]
+    total_lines_removed: i64,
+    #[serde(default)]
+    total_duration: i64,
+    #[serde(default)]
+    start_time: i64,
+    #[serde(default)]
+    model_usage: HashMap<String, ModelUsage>,
+}
+
+/// One model's entry in cost-state.modelUsage. Only the cost is read; token
+/// counts are already tracked per assistant message.
+#[derive(Debug, Deserialize, Default)]
+struct ModelUsage {
+    #[serde(default, rename = "costUSD")]
+    cost_usd: f64,
 }
 
 /// Error payload on system.api_error lines.
@@ -149,6 +181,13 @@ struct Attachment {
     skill_count: i64,
     #[serde(default)]
     is_initial: bool,
+    /// task_status (background subagent progress)
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    delta_summary: String,
 }
 
 /// One file's worth of LSP diagnostics.
@@ -230,6 +269,31 @@ struct ToolInput {
     task_id: String,
     #[serde(default)]
     cron: String,
+    /// SendUserFile
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    caption: String,
+    /// AskUserQuestion
+    #[serde(default)]
+    questions: Vec<ToolInputQuestion>,
+    /// SendMessage
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    message: String,
+    /// Artifact
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    url: String,
+}
+
+/// One entry in AskUserQuestion's `questions` array.
+#[derive(Debug, Deserialize, serde::Serialize, Default)]
+struct ToolInputQuestion {
+    #[serde(default)]
+    question: String,
 }
 
 /// Shorten an MCP tool name. `mcp__plugin_context7_context7__query-docs`
@@ -279,6 +343,9 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
             | "permission-mode"
             | "attachment"
             | "pr-link"
+            | "frame-link"
+            | "continued-in"
+            | "cost-state"
             | "queue-operation"
     );
     if !handled && !debug_all {
@@ -332,6 +399,29 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
             }
         }
         "pr-link" => parse_pr_link(&raw, timestamp),
+        "frame-link" => {
+            let items = parse_frame_link(&raw, timestamp);
+            if debug_all && items.is_empty() {
+                vec![debug_item(&raw, line, timestamp)]
+            } else {
+                items
+            }
+        }
+        "continued-in" => {
+            if raw.continued_in_session_id.is_empty() {
+                vec![]
+            } else {
+                let agent_name = agent_display_name(&raw.agent_id);
+                vec![session_event(
+                    &raw,
+                    timestamp,
+                    &agent_name,
+                    "continued in",
+                    &raw.continued_in_session_id,
+                )]
+            }
+        }
+        "cost-state" => parse_cost_state(&raw, timestamp),
         "queue-operation" => parse_queue_operation(&raw, timestamp),
         _ => {
             if debug_all {
@@ -461,7 +551,31 @@ fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
                 vec![]
             }
         }
+        "task_status" => {
+            // Background subagent progress: "task running: <description> — <delta>".
+            let detail = task_status_detail(att);
+            if detail.is_empty() {
+                vec![]
+            } else {
+                let label = if att.status.is_empty() {
+                    "task".to_string()
+                } else {
+                    format!("task {}", att.status)
+                };
+                vec![session_event(raw, timestamp, &agent_name, &label, &detail)]
+            }
+        }
         _ => vec![],
+    }
+}
+
+/// Join a task_status attachment's description and delta summary. Empty
+/// when both are empty (caller should drop the event).
+fn task_status_detail(att: &Attachment) -> String {
+    match (att.description.is_empty(), att.delta_summary.is_empty()) {
+        (false, false) => format!("{} — {}", att.description, att.delta_summary),
+        (false, true) => att.description.clone(),
+        (true, _) => att.delta_summary.clone(),
     }
 }
 
@@ -653,6 +767,104 @@ fn parse_pr_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> 
         cache_read_tokens: None,
         model: None,
     }]
+}
+
+/// Artifact-link marker for type="frame-link" lines, written when the
+/// Artifact tool publishes a page to claude.ai. The first line for an
+/// artifact carries its title and URL; later lines (redeploys, watch
+/// bookkeeping) carry only an artifact count and are dropped.
+fn parse_frame_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+    if raw.frame_url.is_empty() {
+        return vec![];
+    }
+    let content = if raw.title.is_empty() {
+        format!("artifact → {}", raw.frame_url)
+    } else {
+        format!("artifact \"{}\" → {}", raw.title, raw.frame_url)
+    };
+    vec![StreamItem {
+        item_type: StreamItemType::ArtifactLink,
+        session_id: raw.session_id.clone(),
+        agent_id: String::new(),
+        agent_name: String::new(),
+        timestamp,
+        content,
+        tool_name: None,
+        tool_id: None,
+        duration_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+        model: None,
+    }]
+}
+
+/// Session-cost marker for type="cost-state" lines:
+/// "$13.75 · +1003/-168 lines · opus-5 sonnet-5 haiku-4-5". Claude Code
+/// writes the line at session end without a timestamp, so the event time is
+/// reconstructed from start_time + total_duration when both are present.
+fn parse_cost_state(raw: &RawMessage, fallback: DateTime<Utc>) -> Vec<StreamItem> {
+    if raw.total_cost_usd == 0.0 && raw.model_usage.is_empty() {
+        return vec![];
+    }
+    let timestamp = if raw.start_time > 0 && raw.total_duration > 0 {
+        DateTime::from_timestamp_millis(raw.start_time + raw.total_duration).unwrap_or(fallback)
+    } else {
+        fallback
+    };
+    let mut parts = vec![format!("${:.2}", raw.total_cost_usd)];
+    if raw.total_lines_added > 0 || raw.total_lines_removed > 0 {
+        parts.push(format!(
+            "+{}/-{} lines",
+            raw.total_lines_added, raw.total_lines_removed
+        ));
+    }
+    let models = cost_state_models(&raw.model_usage);
+    if !models.is_empty() {
+        parts.push(models);
+    }
+    let agent_name = agent_display_name(&raw.agent_id);
+    vec![session_event(
+        raw,
+        timestamp,
+        &agent_name,
+        "session cost",
+        &parts.join(" · "),
+    )]
+}
+
+/// List the models in a cost-state entry, most expensive first, with the
+/// "claude-" prefix and any dated suffix stripped so the marker stays
+/// short: "opus-5 sonnet-5 haiku-4-5".
+fn cost_state_models(usage: &HashMap<String, ModelUsage>) -> String {
+    let mut names: Vec<&String> = usage.keys().collect();
+    names.sort_by(|a, b| {
+        let (ca, cb) = (usage[*a].cost_usd, usage[*b].cost_usd);
+        cb.partial_cmp(&ca)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    names
+        .into_iter()
+        .map(|n| short_model_name(n))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Turn "claude-haiku-4-5-20251001" into "haiku-4-5".
+fn short_model_name(model: &str) -> String {
+    let name = model.strip_prefix("claude-").unwrap_or(model);
+    if let Some((head, tail)) = name.rsplit_once('-') {
+        if !head.is_empty()
+            && tail.len() == 8
+            && tail.chars().all(|c| c.is_ascii_digit())
+            && chrono::NaiveDate::parse_from_str(tail, "%Y%m%d").is_ok()
+        {
+            return head.to_string();
+        }
+    }
+    name.to_string()
 }
 
 /// Handle system-type JSONL lines. Surfaces:
@@ -1135,7 +1347,8 @@ fn format_tool_input(tool_name: &str, input: &Value) -> String {
     let input: ToolInput = serde_json::from_value(input.clone()).unwrap_or_default();
 
     match tool_name {
-        "Bash" => {
+        // Monitor shares Bash's shape: a shell command plus a description.
+        "Bash" | "Monitor" => {
             if !input.description.is_empty() {
                 format!("{}\n  # {}", input.command, input.description)
             } else {
@@ -1204,6 +1417,57 @@ fn format_tool_input(tool_name: &str, input: &Value) -> String {
                 format!("{}: {}", input.cron, input.prompt)
             } else {
                 String::new()
+            }
+        }
+        "SendUserFile" => {
+            let files = input
+                .files
+                .iter()
+                .map(|f| {
+                    std::path::Path::new(f)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| f.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !files.is_empty() && !input.caption.is_empty() {
+                format!("{}\n  # {}", files, input.caption)
+            } else if !files.is_empty() {
+                files
+            } else {
+                input.caption
+            }
+        }
+        "AskUserQuestion" => input
+            .questions
+            .iter()
+            .filter(|q| !q.question.is_empty())
+            .map(|q| q.question.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "SendMessage" => {
+            if !input.to.is_empty() {
+                format!("→ {}: {}", input.to, input.message)
+            } else {
+                input.message
+            }
+        }
+        "ListAgents" => "(list agents)".to_string(),
+        "Artifact" => {
+            let action = if input.action.is_empty() {
+                "publish"
+            } else {
+                input.action.as_str()
+            };
+            if !input.file_path.is_empty() && !input.url.is_empty() {
+                format!("{} {} → {}", action, input.file_path, input.url)
+            } else if !input.file_path.is_empty() {
+                format!("{} {}", action, input.file_path)
+            } else if !input.url.is_empty() {
+                format!("{} {}", action, input.url)
+            } else {
+                action.to_string()
             }
         }
         _ => {
@@ -1912,5 +2176,224 @@ mod tests {
         assert_eq!(items[0].item_type, StreamItemType::PRLink);
 
         DEBUG_ALL.store(false, Ordering::Relaxed);
+    }
+
+    // --- v0.12.0: frame-link, continued-in, cost-state, task_status ---
+
+    #[test]
+    fn test_parse_frame_link() {
+        let line = r#"{"type":"frame-link","sessionId":"4f9aca60","path":"/tmp/scratch/marblemath.html","frameUrl":"https://claude.ai/code/artifact/d9254fd4-fadd-49af-a025-b168723f9530","title":"MarbleMath","artifactCount":1,"timestamp":"2026-08-23T21:59:11.397Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::ArtifactLink);
+        assert_eq!(
+            items[0].content,
+            "artifact \"MarbleMath\" → https://claude.ai/code/artifact/d9254fd4-fadd-49af-a025-b168723f9530"
+        );
+        assert_eq!(items[0].session_id, "4f9aca60");
+    }
+
+    #[test]
+    fn test_parse_frame_link_no_title() {
+        let line = r#"{"type":"frame-link","sessionId":"s","frameUrl":"https://claude.ai/code/artifact/abc","artifactCount":1,"timestamp":"2026-08-23T21:59:11.397Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].content,
+            "artifact → https://claude.ai/code/artifact/abc"
+        );
+    }
+
+    #[test]
+    fn test_parse_frame_link_count_only_dropped() {
+        let _g = debug_all_lock();
+        // Redeploys and watch bookkeeping re-emit frame-link with only a count.
+        let line = r#"{"type":"frame-link","artifactCount":1,"sessionId":"s","timestamp":"2026-08-23T22:06:10.001Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_frame_link_count_only_debug() {
+        let _g = debug_all_lock();
+        DEBUG_ALL.store(true, Ordering::Relaxed);
+        let line = r#"{"type":"frame-link","artifactCount":1,"sessionId":"s","timestamp":"2026-08-23T22:06:10.001Z"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::Debug);
+        assert_eq!(items[0].tool_name.as_deref(), Some("frame-link"));
+    }
+
+    #[test]
+    fn test_parse_continued_in() {
+        let line = r#"{"type":"continued-in","timestamp":"2026-09-04T21:38:04.469Z","sessionId":"d2bf19dc","continuedInSessionId":"6ee341a1-87cb-4157-a678-ceafb0bd48c6"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("continued in"));
+        assert_eq!(items[0].content, "6ee341a1-87cb-4157-a678-ceafb0bd48c6");
+    }
+
+    #[test]
+    fn test_parse_continued_in_empty_dropped() {
+        let _g = debug_all_lock();
+        let line = r#"{"type":"continued-in","timestamp":"2026-09-04T21:38:04.469Z","sessionId":"d2bf19dc"}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_cost_state() {
+        // Real shape: no timestamp field; startTime + totalDuration (ms) locate it.
+        let line = r#"{"type":"cost-state","sessionId":"0e1f948f","totalCostUSD":13.749958700000004,"totalAPIDuration":1397557,"totalAPIDurationWithoutRetries":1397291,"totalToolDuration":850473,"totalLinesAdded":1003,"totalLinesRemoved":168,"totalDuration":58855298,"startTime":1788522122378,"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":45592,"outputTokens":712,"costUSD":0.049152},"claude-sonnet-5":{"inputTokens":6294,"outputTokens":96305,"costUSD":1.2},"claude-opus-5":{"inputTokens":5499,"outputTokens":203056,"costUSD":12.5}},"hasUnknownModelCost":false}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("session cost"));
+        assert_eq!(
+            items[0].content,
+            "$13.75 · +1003/-168 lines · opus-5 sonnet-5 haiku-4-5"
+        );
+        let want = DateTime::from_timestamp_millis(1788522122378 + 58855298).unwrap();
+        assert_eq!(items[0].timestamp, want);
+    }
+
+    #[test]
+    fn test_parse_cost_state_no_lines() {
+        let line = r#"{"type":"cost-state","sessionId":"s","totalCostUSD":1.2836649999999998,"totalLinesAdded":0,"totalLinesRemoved":0,"totalDuration":95160,"startTime":1788264806385,"modelUsage":{"claude-opus-5":{"costUSD":1.28}}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "$1.28 · opus-5");
+    }
+
+    #[test]
+    fn test_parse_cost_state_empty_dropped() {
+        let _g = debug_all_lock();
+        let line = r#"{"type":"cost-state","sessionId":"s","totalCostUSD":0,"modelUsage":{}}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_short_model_name() {
+        assert_eq!(short_model_name("claude-haiku-4-5-20251001"), "haiku-4-5");
+        assert_eq!(short_model_name("claude-opus-5"), "opus-5");
+        assert_eq!(short_model_name("claude-fable-5-1"), "fable-5-1");
+        assert_eq!(short_model_name("claude-sonnet-4-5"), "sonnet-4-5");
+        assert_eq!(short_model_name("gpt-4o"), "gpt-4o");
+    }
+
+    #[test]
+    fn test_parse_task_status() {
+        let line = r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"task_status","taskId":"a9c1d0bd1b5243cd3","taskType":"local_agent","description":"Brainstorm next steps for Towerstakes","status":"running","deltaSummary":"Comparing rush pacing in econ/rush.go","outputFilePath":"/tmp/x.output"}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("task running"));
+        assert_eq!(
+            items[0].content,
+            "Brainstorm next steps for Towerstakes — Comparing rush pacing in econ/rush.go"
+        );
+    }
+
+    #[test]
+    fn test_parse_task_status_empty_dropped() {
+        let _g = debug_all_lock();
+        let line = r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"task_status","taskId":"x","status":"running"}}"#;
+        let items = parse_line(line).unwrap();
+        assert!(items.is_empty());
+    }
+
+    /// Pins the deliberate-drop list for line types introduced in Claude
+    /// Code 2.1.235–2.1.261. These are high-volume bookkeeping (atis-latch
+    /// alone is ~2k lines per 90 sessions) and must stay out of the stream
+    /// without DEBUG_ALL.
+    #[test]
+    fn test_parse_new_noise_types_dropped() {
+        let _g = debug_all_lock();
+        let lines = [
+            r#"{"type":"atis-latch","atis":"","sessionId":"s"}"#,
+            r#"{"type":"artifact-autoreact-ledger","v":1,"sessionId":"s","artifacts":{}}"#,
+            r#"{"type":"artifact-comment-monitor","v":1,"sessionId":"s","artifacts":{}}"#,
+            r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"bash_output_audience_note","toolUseID":"toolu_01"}}"#,
+            r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"batching_reminder_sent","text":"...","model":"claude-fable-5"}}"#,
+            r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"silent_turn_reminder","text":"..."}}"#,
+            r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"remote_session_change","url":null,"commit":"Co-Authored-By: x","pr":"y","sendUserFileHint":true}}"#,
+            r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"plan_mode","reminderType":"full","isSubAgent":false,"planFilePath":"/x.md","planExists":false}}"#,
+        ];
+        for line in lines {
+            let items = parse_line(line).unwrap();
+            assert!(items.is_empty(), "expected drop for {line}, got {items:?}");
+        }
+    }
+
+    #[test]
+    fn test_format_tool_input_v0_12_tools() {
+        fn fmt(name: &str, input: &str) -> String {
+            let v: Value = serde_json::from_str(input).unwrap();
+            format_tool_input(name, &v)
+        }
+        assert_eq!(
+            fmt(
+                "SendUserFile",
+                r#"{"files":["/tmp/a/review_before.png","/tmp/a/review_poses.png"],"status":"normal","caption":"Before and after"}"#
+            ),
+            "review_before.png, review_poses.png\n  # Before and after"
+        );
+        assert_eq!(
+            fmt("SendUserFile", r#"{"files":["/tmp/a/x.png"]}"#),
+            "x.png"
+        );
+        assert_eq!(fmt("SendUserFile", r#"{"caption":"hi"}"#), "hi");
+        assert_eq!(
+            fmt(
+                "AskUserQuestion",
+                r#"{"questions":[{"question":"What scope?","header":"Scope","options":[]},{"question":"Which lib?","header":"Lib"}]}"#
+            ),
+            "What scope?\nWhich lib?"
+        );
+        assert_eq!(fmt("AskUserQuestion", r#"{"questions":[]}"#), "");
+        assert_eq!(
+            fmt(
+                "Monitor",
+                r#"{"command":"tail -f x.log","description":"watch the log","timeout_ms":3000}"#
+            ),
+            "tail -f x.log\n  # watch the log"
+        );
+        assert_eq!(
+            fmt("Monitor", r#"{"command":"tail -f x.log"}"#),
+            "tail -f x.log"
+        );
+        assert_eq!(
+            fmt("SendMessage", r#"{"to":"a3b166f9","message":"Nice work"}"#),
+            "→ a3b166f9: Nice work"
+        );
+        assert_eq!(
+            fmt("SendMessage", r#"{"message":"Nice work"}"#),
+            "Nice work"
+        );
+        assert_eq!(fmt("ListAgents", r#"{}"#), "(list agents)");
+        assert_eq!(
+            fmt(
+                "Artifact",
+                r#"{"file_path":"/tmp/s/marblemath.html","favicon":"🔵","description":"Design doc"}"#
+            ),
+            "publish /tmp/s/marblemath.html"
+        );
+        assert_eq!(
+            fmt(
+                "Artifact",
+                r#"{"file_path":"/tmp/s/m.html","url":"https://claude.ai/code/artifact/abc"}"#
+            ),
+            "publish /tmp/s/m.html → https://claude.ai/code/artifact/abc"
+        );
+        assert_eq!(
+            fmt(
+                "Artifact",
+                r#"{"action":"read","url":"https://claude.ai/code/artifact/abc"}"#
+            ),
+            "read https://claude.ai/code/artifact/abc"
+        );
+        assert_eq!(fmt("Artifact", r#"{"action":"list"}"#), "list");
     }
 }

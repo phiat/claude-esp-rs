@@ -76,6 +76,7 @@ fn test_real_jsonl_parsing() {
                         | StreamItemType::HookOutput
                         | StreamItemType::Diagnostics
                         | StreamItemType::PRLink
+                        | StreamItemType::ArtifactLink
                         | StreamItemType::Debug
                         | StreamItemType::SessionTitle
                         | StreamItemType::CacheMiss

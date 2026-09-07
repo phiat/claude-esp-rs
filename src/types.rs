@@ -42,6 +42,9 @@ pub enum StreamItemType {
     /// API request failure + retry progress from system.api_error lines.
     /// Rendered as a single red divider line.
     ApiError,
+    /// Artifact published to claude.ai, from type=frame-link lines.
+    /// Rendered like PRLink.
+    ArtifactLink,
 }
 
 /// A single item in the output stream
