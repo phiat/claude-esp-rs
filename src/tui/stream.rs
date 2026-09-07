@@ -267,6 +267,7 @@ impl StreamView {
                     StreamItemType::TurnMarker
                     | StreamItemType::CompactMarker
                     | StreamItemType::PRLink
+                    | StreamItemType::ArtifactLink
                     | StreamItemType::HookOutput
                     | StreamItemType::Diagnostics
                     | StreamItemType::Debug
@@ -321,7 +322,7 @@ impl StreamView {
                     .push(Line::from(Span::styled(text, muted_style())));
                 return;
             }
-            StreamItemType::PRLink => {
+            StreamItemType::PRLink | StreamItemType::ArtifactLink => {
                 self.rendered_lines.push(Line::from(Span::styled(
                     format!("── {} ──", item.content),
                     muted_style(),
@@ -380,6 +381,7 @@ impl StreamView {
             StreamItemType::TurnMarker
             | StreamItemType::CompactMarker
             | StreamItemType::PRLink
+            | StreamItemType::ArtifactLink
             | StreamItemType::CacheMiss
             | StreamItemType::SessionEvent
             | StreamItemType::ApiError
@@ -475,6 +477,7 @@ impl StreamView {
             StreamItemType::TurnMarker
             | StreamItemType::CompactMarker
             | StreamItemType::PRLink
+            | StreamItemType::ArtifactLink
             | StreamItemType::CacheMiss
             | StreamItemType::SessionEvent
             | StreamItemType::ApiError
