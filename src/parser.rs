@@ -117,6 +117,17 @@ struct RawMessage {
     start_time: i64,
     #[serde(default)]
     model_usage: HashMap<String, ModelUsage>,
+    /// system.model_refusal_no_fallback fields.
+    #[serde(default)]
+    original_model: String,
+    #[serde(default)]
+    api_refusal_category: String,
+    /// system.scheduled_task_fire: the cron expression and the prompt it
+    /// injected.
+    #[serde(default)]
+    cron: String,
+    #[serde(default)]
+    prompt: String,
 }
 
 /// One model's entry in cost-state.modelUsage. Only the cost is read; token
@@ -150,9 +161,10 @@ struct CompactMetadata {
 }
 
 /// Payload on a type="attachment" line. Subtype-dependent fields share one
-/// struct to avoid per-subtype unmarshalling. `content` is intentionally
-/// omitted because subtypes disagree on its shape (string for hook_success,
-/// array for task_reminder); use `stdout` for hooks.
+/// struct to avoid per-subtype unmarshalling. `content` stays a raw `Value`
+/// because subtypes disagree on its shape (string for hook_success, string
+/// array for hook_additional_context, object array for task_reminder); use
+/// `stdout` for hook_success.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Attachment {
@@ -161,9 +173,18 @@ struct Attachment {
     #[serde(default)]
     hook_name: String,
     #[serde(default)]
+    content: Value,
+    #[serde(default)]
     stdout: String,
     #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    exit_code: i64,
+    #[serde(default)]
     duration_ms: i64,
+    /// hook_blocking_error nests the message one level down.
+    #[serde(default)]
+    blocking_error: Option<HookBlockingError>,
     #[serde(default)]
     files: Vec<DiagnosticFile>,
     /// plan_mode_exit
@@ -188,6 +209,14 @@ struct Attachment {
     status: String,
     #[serde(default)]
     delta_summary: String,
+}
+
+/// Payload on attachment.hook_blocking_error.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HookBlockingError {
+    #[serde(default)]
+    blocking_error: String,
 }
 
 /// One file's worth of LSP diagnostics.
@@ -287,6 +316,12 @@ struct ToolInput {
     action: String,
     #[serde(default)]
     url: String,
+    /// CronDelete
+    #[serde(default)]
+    id: String,
+    /// SendFeedback
+    #[serde(default)]
+    title: String,
 }
 
 /// One entry in AskUserQuestion's `questions` array.
@@ -510,6 +545,30 @@ fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
             cache_read_tokens: None,
             model: None,
         }],
+        "hook_additional_context" => {
+            let body = hook_context_body(&att.content);
+            if body.is_empty() {
+                vec![]
+            } else {
+                vec![hook_item(raw, timestamp, agent_name, att, body)]
+            }
+        }
+        "hook_blocking_error" => match &att.blocking_error {
+            Some(b) if !b.blocking_error.is_empty() => {
+                let body = format!("blocked: {}", b.blocking_error);
+                vec![hook_item(raw, timestamp, agent_name, att, body)]
+            }
+            _ => vec![],
+        },
+        "hook_non_blocking_error" => {
+            vec![hook_item(
+                raw,
+                timestamp,
+                agent_name,
+                att,
+                hook_error_body(att),
+            )]
+        }
         "diagnostics" => diagnostics_items(raw, timestamp, &agent_name, att),
         "plan_mode_exit" => vec![session_event(
             raw,
@@ -566,6 +625,63 @@ fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
             }
         }
         _ => vec![],
+    }
+}
+
+/// Build a HookOutput item for a hook attachment, labelled by the hook name
+/// (e.g. "PreToolUse:Write") so it renders like hook_success.
+fn hook_item(
+    raw: &RawMessage,
+    timestamp: DateTime<Utc>,
+    agent_name: String,
+    att: &Attachment,
+    body: String,
+) -> StreamItem {
+    StreamItem {
+        item_type: StreamItemType::HookOutput,
+        session_id: raw.session_id.clone(),
+        agent_id: raw.agent_id.clone(),
+        agent_name,
+        timestamp,
+        content: body,
+        tool_name: Some(att.hook_name.clone()),
+        tool_id: None,
+        duration_ms: Some(att.duration_ms),
+        input_tokens: None,
+        output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+        model: None,
+    }
+}
+
+/// Join hook_additional_context's content, a list of strings. Empty for an
+/// empty or differently-shaped payload.
+fn hook_context_body(content: &Value) -> String {
+    let Some(parts) = content.as_array() else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Render a hook_non_blocking_error as "error (exit N): <stderr>".
+fn hook_error_body(att: &Attachment) -> String {
+    let head = if att.exit_code != 0 {
+        format!("error (exit {})", att.exit_code)
+    } else {
+        "error".to_string()
+    };
+    let msg = att.stderr.trim();
+    if msg.is_empty() {
+        head
+    } else {
+        format!("{head}: {msg}")
     }
 }
 
@@ -876,8 +992,12 @@ fn short_model_name(model: &str) -> String {
 ///   - subtype=local_command → SessionEvent (slash command invoked)
 ///   - subtype=informational → SessionEvent (transient notice, e.g. backgrounding)
 ///   - subtype=agents_killed → SessionEvent (subagents terminated)
+///   - subtype=model_refusal_no_fallback → SessionEvent (request refused)
+///   - subtype=scheduled_task_fire → SessionEvent (cron / loop job fired)
 ///
-/// Other subtypes are intentionally dropped.
+/// Other subtypes are intentionally dropped. stop_hook_summary in particular
+/// fires on every stop; the interesting case (a hook blocking the stop)
+/// arrives as attachment.hook_blocking_error.
 fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
     let agent_name = agent_display_name(&raw.agent_id);
     match raw.subtype.as_str() {
@@ -972,7 +1092,46 @@ fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<Strea
             "agents killed",
             "",
         )],
+        "model_refusal_no_fallback" => vec![session_event(
+            raw,
+            timestamp,
+            &agent_name,
+            "refused",
+            &refusal_detail(raw),
+        )],
+        "scheduled_task_fire" => vec![session_event(
+            raw,
+            timestamp,
+            &agent_name,
+            "scheduled task",
+            &scheduled_task_detail(raw),
+        )],
         _ => vec![],
+    }
+}
+
+/// Render a refusal as "<category> (<model>)", with either part omitted when
+/// absent.
+fn refusal_detail(raw: &RawMessage) -> String {
+    let model = if raw.original_model.is_empty() {
+        String::new()
+    } else {
+        short_model_name(&raw.original_model)
+    };
+    match (raw.api_refusal_category.is_empty(), model.is_empty()) {
+        (false, false) => format!("{} ({model})", raw.api_refusal_category),
+        (false, true) => raw.api_refusal_category.clone(),
+        (true, _) => model,
+    }
+}
+
+/// Render "<cron>: <prompt>", falling back to the line's own "Running
+/// scheduled task (…)" content when the prompt is missing.
+fn scheduled_task_detail(raw: &RawMessage) -> String {
+    match (raw.cron.is_empty(), raw.prompt.is_empty()) {
+        (false, false) => format!("{}: {}", raw.cron, raw.prompt),
+        (_, false) => raw.prompt.clone(),
+        (_, true) => raw.queue_content.clone(),
     }
 }
 
@@ -1454,6 +1613,15 @@ fn format_tool_input(tool_name: &str, input: &Value) -> String {
             }
         }
         "ListAgents" => "(list agents)".to_string(),
+        "SubagentHandback" => input.message,
+        "CronDelete" => {
+            if input.id.is_empty() {
+                String::new()
+            } else {
+                format!("cron {}", input.id)
+            }
+        }
+        "SendFeedback" => input.title,
         "Artifact" => {
             let action = if input.action.is_empty() {
                 "publish"
@@ -2395,5 +2563,115 @@ mod tests {
             "read https://claude.ai/code/artifact/abc"
         );
         assert_eq!(fmt("Artifact", r#"{"action":"list"}"#), "list");
+        assert_eq!(
+            fmt(
+                "SubagentHandback",
+                r#"{"message":"Unison: report\n\nAll 6 snippets pass."}"#
+            ),
+            "Unison: report\n\nAll 6 snippets pass."
+        );
+        assert_eq!(fmt("CronDelete", r#"{"id":"0d4716b9"}"#), "cron 0d4716b9");
+        assert_eq!(
+            fmt(
+                "SendFeedback",
+                r#"{"type":"bug","title":"Picker needs a mouse","details":"- **What happened:** ..."}"#
+            ),
+            "Picker needs a mouse"
+        );
+    }
+
+    #[test]
+    fn test_parse_hook_attachments() {
+        let cases = [
+            (
+                r#"{"type":"attachment","timestamp":"2026-09-19T22:45:11Z","sessionId":"s","attachment":{"type":"hook_additional_context","content":["first note","second note"],"hookName":"UserPromptSubmit","toolUseID":"hook-1","hookEvent":"UserPromptSubmit"}}"#,
+                "UserPromptSubmit",
+                "first note\nsecond note",
+            ),
+            (
+                r#"{"type":"attachment","timestamp":"2026-09-19T22:41:11Z","sessionId":"s","attachment":{"type":"hook_blocking_error","hookName":"Stop","toolUseID":"t","hookEvent":"Stop","blockingError":{"blockingError":"no test ran after the last edit","command":"check claims"}}}"#,
+                "Stop",
+                "blocked: no test ran after the last edit",
+            ),
+            (
+                r#"{"type":"attachment","timestamp":"2026-09-19T22:22:45Z","sessionId":"s","attachment":{"type":"hook_non_blocking_error","hookName":"PreToolUse:Write","toolUseID":"t","hookEvent":"PreToolUse","stderr":"ENOENT: no such file\n","stdout":"","exitCode":1,"command":"check edit","durationMs":7}}"#,
+                "PreToolUse:Write",
+                "error (exit 1): ENOENT: no such file",
+            ),
+        ];
+        for (line, hook_name, want) in cases {
+            let items = parse_line(line).unwrap();
+            assert_eq!(items.len(), 1, "{line}");
+            assert_eq!(items[0].item_type, StreamItemType::HookOutput);
+            assert_eq!(items[0].tool_name.as_deref(), Some(hook_name));
+            assert_eq!(items[0].content, want);
+        }
+    }
+
+    #[test]
+    fn test_parse_hook_attachments_empty_dropped() {
+        let _g = debug_all_lock();
+        let lines = [
+            r#"{"type":"attachment","timestamp":"2026-09-19T22:45:11Z","sessionId":"s","attachment":{"type":"hook_additional_context","content":[],"hookName":"UserPromptSubmit"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-19T22:41:11Z","sessionId":"s","attachment":{"type":"hook_blocking_error","hookName":"Stop","blockingError":{"blockingError":""}}}"#,
+        ];
+        for line in lines {
+            assert!(parse_line(line).unwrap().is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn test_parse_model_refusal() {
+        let line = r#"{"type":"system","subtype":"model_refusal_no_fallback","content":"","level":"warning","originalModel":"claude-opus-5[1m]","requestId":"req_1","apiRefusalCategory":"cyber","apiRefusalExplanation":"blocked","isMeta":false,"timestamp":"2026-09-15T12:34:01Z","sessionId":"s"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("refused"));
+        assert_eq!(items[0].content, "cyber (opus-5[1m])");
+    }
+
+    #[test]
+    fn test_parse_scheduled_task_fire() {
+        let cases = [
+            (
+                r#"{"type":"system","subtype":"scheduled_task_fire","content":"Running scheduled task (Sep 22 8:10am)","timestamp":"2026-09-22T12:10:57Z","sessionId":"s","taskId":"0d4716b9","cron":"*/5 * * * *","prompt":"check the deploy"}"#,
+                "*/5 * * * *: check the deploy",
+            ),
+            (
+                r#"{"type":"system","subtype":"scheduled_task_fire","content":"Running scheduled task (Sep 22 8:10am)","timestamp":"2026-09-22T12:10:57Z","sessionId":"s"}"#,
+                "Running scheduled task (Sep 22 8:10am)",
+            ),
+        ];
+        for (line, want) in cases {
+            let items = parse_line(line).unwrap();
+            assert_eq!(items.len(), 1, "{line}");
+            assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+            assert_eq!(items[0].tool_name.as_deref(), Some("scheduled task"));
+            assert_eq!(items[0].content, want);
+        }
+    }
+
+    /// Session-start echoes, cache telemetry and per-stop hook summaries are
+    /// deliberately left dropped.
+    #[test]
+    fn test_parse_v013_dropped() {
+        let _g = debug_all_lock();
+        let lines = [
+            r#"{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"date","date":"2026-09-13"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"environment","snapshot":{"workingDirectory":"/x"}}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"instructions","files":[{"path":"/x/CLAUDE.md","type":"Project","content":"X"}]}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"model","identity":{"modelId":"claude-opus-5[1m]"},"text":"You are powered by Opus 5."}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"session_context","context":{"gitStatus":"clean"}}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"prompt_snapshot","systemPrompt":["You are an agent"]}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"deferred_tools_record","entries":[{"name":"WebFetch"}]}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-12T13:53:43Z","sessionId":"s","attachment":{"type":"thinking_stripped","scope":"all"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-18T00:49:32Z","sessionId":"s","attachment":{"type":"thinking_drop","model":"claude-fable-5-1","thinkingBlocksSent":14}}"#,
+            r#"{"type":"attachment","timestamp":"2026-09-18T00:46:11Z","sessionId":"s","attachment":{"type":"opened_file_in_ide","filename":"/x/cpu.rs"}}"#,
+            r#"{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookInfos":[{"command":"c","durationMs":561}],"hookErrors":[],"preventedContinuation":false,"level":"suggestion","timestamp":"2026-09-19T22:30:48Z","sessionId":"s"}"#,
+            r#"{"type":"fork-context-ref","agentId":"af476ef8d89ec8227","parentSessionId":"p","parentLastUuid":"u","contextLength":82}"#,
+        ];
+        for line in lines {
+            assert!(parse_line(line).unwrap().is_empty(), "{line}");
+        }
     }
 }
