@@ -578,6 +578,13 @@ fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
             &plan_mode_exit_detail(att),
         )],
         "auto_mode" => vec![session_event(raw, timestamp, &agent_name, "auto mode", "")],
+        "auto_mode_exit" => vec![session_event(
+            raw,
+            timestamp,
+            &agent_name,
+            "auto mode exit",
+            "",
+        )],
         "deferred_tools_delta" => {
             let detail = name_delta_detail(att);
             if detail.is_empty() {
@@ -1228,6 +1235,7 @@ pub fn context_window_for(model: &str) -> i64 {
         || model.starts_with("claude-mythos-5")
         || model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-5")
+        || model.starts_with("claude-haiku-5")
         || model.starts_with("claude-opus-4-8")
         || model.starts_with("claude-opus-4-7")
         || model.starts_with("claude-opus-4-6")
@@ -2154,6 +2162,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_auto_mode_exit() {
+        let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"auto_mode_exit","bashFirst":true,"steerOnly":true}}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, StreamItemType::SessionEvent);
+        assert_eq!(items[0].tool_name.as_deref(), Some("auto mode exit"));
+    }
+
+    #[test]
     fn test_parse_deferred_tools_delta() {
         let line = r#"{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"deferred_tools_delta","addedNames":["A","B","C"],"removedNames":["D"]}}"#;
         let items = parse_line(line).unwrap();
@@ -2267,6 +2284,9 @@ mod tests {
         assert_eq!(context_window_for("claude-mythos-5"), 1_000_000);
         assert_eq!(context_window_for("claude-opus-5"), 1_000_000);
         assert_eq!(context_window_for("claude-sonnet-5"), 1_000_000);
+        assert_eq!(context_window_for("claude-opus-5-5"), 1_000_000);
+        assert_eq!(context_window_for("claude-sonnet-5-5"), 1_000_000);
+        assert_eq!(context_window_for("claude-haiku-5-5"), 1_000_000);
         assert_eq!(context_window_for("claude-opus-4-8"), 1_000_000);
         assert_eq!(context_window_for("claude-opus-4-6"), 1_000_000);
         assert_eq!(context_window_for("claude-sonnet-4-5"), 200_000);
@@ -2669,6 +2689,33 @@ mod tests {
             r#"{"type":"attachment","timestamp":"2026-09-18T00:46:11Z","sessionId":"s","attachment":{"type":"opened_file_in_ide","filename":"/x/cpu.rs"}}"#,
             r#"{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookInfos":[{"command":"c","durationMs":561}],"hookErrors":[],"preventedContinuation":false,"level":"suggestion","timestamp":"2026-09-19T22:30:48Z","sessionId":"s"}"#,
             r#"{"type":"fork-context-ref","agentId":"af476ef8d89ec8227","parentSessionId":"p","parentLastUuid":"u","contextLength":82}"#,
+        ];
+        for line in lines {
+            assert!(parse_line(line).unwrap().is_empty(), "{line}");
+        }
+    }
+
+    /// Request-body capture, session plumbing and echoes of events already
+    /// shown elsewhere are deliberately left dropped. The type-only lines
+    /// carry no payload because dispatch is by type.
+    #[test]
+    fn test_parse_v014_dropped() {
+        let _g = debug_all_lock();
+        let lines = [
+            r#"{"type":"attachment","timestamp":"2026-10-19T23:12:49Z","sessionId":"s","attachment":{"type":"agent_listing_delta","addedTypes":["Explore","Plan"],"removedTypes":[],"isInitial":true,"showConcurrencyNote":true}}"#,
+            r#"{"type":"attachment","timestamp":"2026-10-19T23:12:49Z","sessionId":"s","attachment":{"type":"queued_command","prompt":"<task-notification><status>completed</status></task-notification>","commandMode":"task-notification"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-10-19T23:12:49Z","sessionId":"s","attachment":{"type":"remote_session_change","url":null,"commit":"Co-Authored-By: Claude <noreply@anthropic.com>","pr":"Generated with Claude Code","sendUserFileHint":false,"managedCommit":false,"managedPr":false}}"#,
+            r#"{"type":"attachment","timestamp":"2026-10-19T23:12:49Z","sessionId":"s","attachment":{"type":"read_truncation_notice","banner":"[Truncated: PARTIAL view]"}}"#,
+            r#"{"type":"artifact-autoreact-ledger","v":1,"sessionId":"s","artifacts":{"a":{"everBaselined":true,"threads":[]}}}"#,
+            r#"{"type":"artifact-comment-monitor","v":1,"sessionId":"s","artifacts":{"a":{"state":"armed","title":"T"}}}"#,
+            r#"{"type":"api-request-shape","sessionId":"s","shapeHash":"f0","timestamp":"2026-10-19T23:12:49.907Z","version":"2.1.303","shape":{"system":[{"type":"text","text":"x"}]}}"#,
+            r#"{"type":"api-request","sessionId":"s"}"#,
+            r#"{"type":"api-request-blob","sessionId":"s"}"#,
+            r#"{"type":"atis-latch","sessionId":"s"}"#,
+            r#"{"type":"mode","sessionId":"s"}"#,
+            r#"{"type":"last-prompt","sessionId":"s"}"#,
+            r#"{"type":"file-history-snapshot","sessionId":"s"}"#,
+            r#"{"type":"file-history-delta","sessionId":"s"}"#,
         ];
         for line in lines {
             assert!(parse_line(line).unwrap().is_empty(), "{line}");
