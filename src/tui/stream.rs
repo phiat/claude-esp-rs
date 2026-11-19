@@ -603,7 +603,7 @@ impl Widget for &mut StreamView {
 mod tests {
     use super::*;
     use crate::types::StreamItem;
-    use chrono::Utc;
+    use time::OffsetDateTime;
 
     fn test_item(item_type: StreamItemType, tool_id: &str, tool_name: &str) -> StreamItem {
         StreamItem {
@@ -611,7 +611,7 @@ mod tests {
             session_id: "sess1".to_string(),
             agent_id: String::new(),
             agent_name: "Main".to_string(),
-            timestamp: Utc::now(),
+            timestamp: OffsetDateTime::now_utc(),
             content: "content".to_string(),
             tool_name: if tool_name.is_empty() {
                 None

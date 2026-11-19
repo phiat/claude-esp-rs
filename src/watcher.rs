@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -8,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -397,7 +397,7 @@ impl Watcher {
                         session_id: session.id.clone(),
                         agent_id: String::new(),
                         is_active,
-                        last_modified: chrono::DateTime::<chrono::Utc>::from(modified),
+                        last_modified: OffsetDateTime::from(modified),
                     });
                 }
             }
@@ -415,7 +415,7 @@ impl Watcher {
                             session_id: session.id.clone(),
                             agent_id: agent_id.clone(),
                             is_active,
-                            last_modified: chrono::DateTime::<chrono::Utc>::from(modified),
+                            last_modified: OffsetDateTime::from(modified),
                         });
                     }
                 }
@@ -1694,7 +1694,7 @@ fn list_sessions_filtered(limit: usize, active_within: Duration) -> Result<Vec<S
             .map(|d| d.as_secs() < RECENT_ACTIVITY_THRESHOLD_SECS)
             .unwrap_or(false);
 
-        let modified_utc = DateTime::<Utc>::from(modified);
+        let modified_utc = OffsetDateTime::from(modified);
 
         sessions.push(SessionInfo {
             id: basename.trim_end_matches(".jsonl").to_string(),

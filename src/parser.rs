@@ -1,9 +1,9 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 use crate::types::{StreamItem, StreamItemType, AGENT_ID_DISPLAY_LENGTH};
 
@@ -393,9 +393,9 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
         Err(_) => return Ok(vec![]), // Skip if parsing fails
     };
 
-    let timestamp = DateTime::parse_from_rfc3339(&raw.timestamp)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+    let timestamp = OffsetDateTime::parse(&raw.timestamp, &Rfc3339)
+        .map(|dt| dt.to_offset(UtcOffset::UTC))
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
 
     let items = match raw.msg_type.as_str() {
         "assistant" => parse_assistant_message(&raw, timestamp),
@@ -473,7 +473,7 @@ pub fn parse_line(line: &str) -> Result<Vec<StreamItem>> {
 /// Build a Debug stream item describing a line that the parser would
 /// otherwise drop. Label is `<type>`, `system:<subtype>`, or
 /// `attachment.<subtype>`. Content is a truncated raw-JSON preview.
-fn debug_item(raw: &RawMessage, line: &str, timestamp: DateTime<Utc>) -> StreamItem {
+fn debug_item(raw: &RawMessage, line: &str, timestamp: OffsetDateTime) -> StreamItem {
     let label = if raw.msg_type == "system" && !raw.subtype.is_empty() {
         format!("system:{}", raw.subtype)
     } else if raw.msg_type == "attachment" {
@@ -521,7 +521,7 @@ fn debug_item(raw: &RawMessage, line: &str, timestamp: DateTime<Utc>) -> StreamI
 
 /// Dispatch on attachment.type. Surfaces hook_success and diagnostics; every
 /// other subtype is intentionally dropped (DEBUG_ALL surfaces the rest).
-fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_attachment(raw: &RawMessage, timestamp: OffsetDateTime) -> Vec<StreamItem> {
     let att = match &raw.attachment {
         Some(a) => a,
         None => return vec![],
@@ -639,7 +639,7 @@ fn parse_attachment(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
 /// (e.g. "PreToolUse:Write") so it renders like hook_success.
 fn hook_item(
     raw: &RawMessage,
-    timestamp: DateTime<Utc>,
+    timestamp: OffsetDateTime,
     agent_name: String,
     att: &Attachment,
     body: String,
@@ -706,7 +706,7 @@ fn task_status_detail(att: &Attachment) -> String {
 /// can render "<label>: <detail>" or just "<label>" when detail is empty.
 fn session_event(
     raw: &RawMessage,
-    timestamp: DateTime<Utc>,
+    timestamp: OffsetDateTime,
     agent_name: &str,
     label: &str,
     detail: &str,
@@ -759,7 +759,7 @@ fn name_delta_detail(att: &Attachment) -> String {
 /// user enqueues a follow-up prompt or removes one from the queue. Enqueues
 /// whose content is a <task-notification> blob are dropped — those are
 /// internal TaskStop result re-injections, not user-typed prompts.
-fn parse_queue_operation(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_queue_operation(raw: &RawMessage, timestamp: OffsetDateTime) -> Vec<StreamItem> {
     let agent_name = agent_display_name(&raw.agent_id);
     match raw.operation.as_str() {
         "enqueue" => {
@@ -786,7 +786,7 @@ fn parse_queue_operation(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<Stre
 /// One stream item per file with at least one diagnostic.
 fn diagnostics_items(
     raw: &RawMessage,
-    timestamp: DateTime<Utc>,
+    timestamp: OffsetDateTime,
     agent_name: &str,
     att: &Attachment,
 ) -> Vec<StreamItem> {
@@ -860,7 +860,7 @@ fn diagnostics_body(ds: &[Diagnostic]) -> String {
 }
 
 /// PR-link marker: "PR #N repo → url"
-fn parse_pr_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_pr_link(raw: &RawMessage, timestamp: OffsetDateTime) -> Vec<StreamItem> {
     if raw.pr_number == 0 && raw.pr_url.is_empty() {
         return vec![];
     }
@@ -896,7 +896,7 @@ fn parse_pr_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> 
 /// Artifact tool publishes a page to claude.ai. The first line for an
 /// artifact carries its title and URL; later lines (redeploys, watch
 /// bookkeeping) carry only an artifact count and are dropped.
-fn parse_frame_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_frame_link(raw: &RawMessage, timestamp: OffsetDateTime) -> Vec<StreamItem> {
     if raw.frame_url.is_empty() {
         return vec![];
     }
@@ -927,12 +927,12 @@ fn parse_frame_link(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamIte
 /// "$13.75 · +1003/-168 lines · opus-5 sonnet-5 haiku-4-5". Claude Code
 /// writes the line at session end without a timestamp, so the event time is
 /// reconstructed from start_time + total_duration when both are present.
-fn parse_cost_state(raw: &RawMessage, fallback: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_cost_state(raw: &RawMessage, fallback: OffsetDateTime) -> Vec<StreamItem> {
     if raw.total_cost_usd == 0.0 && raw.model_usage.is_empty() {
         return vec![];
     }
     let timestamp = if raw.start_time > 0 && raw.total_duration > 0 {
-        DateTime::from_timestamp_millis(raw.start_time + raw.total_duration).unwrap_or(fallback)
+        datetime_from_millis(raw.start_time + raw.total_duration).unwrap_or(fallback)
     } else {
         fallback
     };
@@ -975,6 +975,23 @@ fn cost_state_models(usage: &HashMap<String, ModelUsage>) -> String {
         .join(" ")
 }
 
+/// Milliseconds since the Unix epoch as a UTC time; `None` when out of range.
+fn datetime_from_millis(ms: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
+}
+
+/// Whether `s` is a valid `YYYYMMDD` calendar date.
+fn is_yyyymmdd(s: &str) -> bool {
+    let year = s.get(0..4).and_then(|p| p.parse::<i32>().ok());
+    let month = s.get(4..6).and_then(|p| p.parse::<u8>().ok());
+    let day = s.get(6..8).and_then(|p| p.parse::<u8>().ok());
+    match (year, month, day) {
+        (Some(y), Some(m), Some(d)) => time::Month::try_from(m)
+            .is_ok_and(|month| time::Date::from_calendar_date(y, month, d).is_ok()),
+        _ => false,
+    }
+}
+
 /// Turn "claude-haiku-4-5-20251001" into "haiku-4-5".
 fn short_model_name(model: &str) -> String {
     let name = model.strip_prefix("claude-").unwrap_or(model);
@@ -982,7 +999,7 @@ fn short_model_name(model: &str) -> String {
         if !head.is_empty()
             && tail.len() == 8
             && tail.chars().all(|c| c.is_ascii_digit())
-            && chrono::NaiveDate::parse_from_str(tail, "%Y%m%d").is_ok()
+            && is_yyyymmdd(tail)
         {
             return head.to_string();
         }
@@ -1005,7 +1022,7 @@ fn short_model_name(model: &str) -> String {
 /// Other subtypes are intentionally dropped. stop_hook_summary in particular
 /// fires on every stop; the interesting case (a hook blocking the stop)
 /// arrives as attachment.hook_blocking_error.
-fn parse_system_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_system_message(raw: &RawMessage, timestamp: OffsetDateTime) -> Vec<StreamItem> {
     let agent_name = agent_display_name(&raw.agent_id);
     match raw.subtype.as_str() {
         "api_error" => vec![StreamItem {
@@ -1252,7 +1269,11 @@ pub fn context_window_for(model: &str) -> i64 {
 /// Emit a TypeSessionTitle item carrying a human-readable label for the
 /// session. Both `agent-name` (Claude-generated) and `custom-title`
 /// (user-set) feed through this.
-fn parse_session_title(raw: &RawMessage, timestamp: DateTime<Utc>, title: &str) -> Vec<StreamItem> {
+fn parse_session_title(
+    raw: &RawMessage,
+    timestamp: OffsetDateTime,
+    title: &str,
+) -> Vec<StreamItem> {
     if title.is_empty() {
         return vec![];
     }
@@ -1274,7 +1295,7 @@ fn parse_session_title(raw: &RawMessage, timestamp: DateTime<Utc>, title: &str) 
     }]
 }
 
-fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_assistant_message(raw: &RawMessage, timestamp: OffsetDateTime) -> Vec<StreamItem> {
     let msg: AssistantMessage = match serde_json::from_value(raw.message.clone()) {
         Ok(m) => m,
         Err(_) => return vec![],
@@ -1434,7 +1455,7 @@ fn parse_assistant_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<St
     items
 }
 
-fn parse_user_message(raw: &RawMessage, timestamp: DateTime<Utc>) -> Vec<StreamItem> {
+fn parse_user_message(raw: &RawMessage, timestamp: OffsetDateTime) -> Vec<StreamItem> {
     let agent_name = agent_display_name(&raw.agent_id);
 
     // Extract duration from toolUseResult.durationMs
@@ -2502,7 +2523,7 @@ mod tests {
             items[0].content,
             "$13.75 · +1003/-168 lines · opus-5 sonnet-5 haiku-4-5"
         );
-        let want = DateTime::from_timestamp_millis(1788522122378 + 58855298).unwrap();
+        let want = datetime_from_millis(1788522122378 + 58855298).unwrap();
         assert_eq!(items[0].timestamp, want);
     }
 
@@ -2529,6 +2550,47 @@ mod tests {
         assert_eq!(short_model_name("claude-fable-5-1"), "fable-5-1");
         assert_eq!(short_model_name("claude-sonnet-4-5"), "sonnet-4-5");
         assert_eq!(short_model_name("gpt-4o"), "gpt-4o");
+        // An 8-digit suffix is dropped only when it is a calendar date.
+        assert_eq!(
+            short_model_name("claude-opus-5-20251301"),
+            "opus-5-20251301"
+        );
+        assert_eq!(
+            short_model_name("claude-opus-5-20250230"),
+            "opus-5-20250230"
+        );
+        assert_eq!(short_model_name("claude-opus-5-20240229"), "opus-5");
+        assert_eq!(
+            short_model_name("claude-opus-5-2025100a"),
+            "opus-5-2025100a"
+        );
+    }
+
+    #[test]
+    fn test_parse_line_timestamp_formats() {
+        let want = datetime_from_millis(1792451569907).unwrap();
+        for ts in ["2026-10-19T23:12:49.907Z", "2026-10-19T19:12:49.907-04:00"] {
+            let line = format!(
+                r#"{{"type":"permission-mode","permissionMode":"plan","sessionId":"s","timestamp":"{ts}"}}"#
+            );
+            let items = parse_line(&line).unwrap();
+            assert_eq!(items.len(), 1, "{ts}");
+            assert_eq!(items[0].timestamp, want, "{ts}");
+            assert_eq!(items[0].timestamp.offset(), UtcOffset::UTC, "{ts}");
+        }
+
+        // An unparseable timestamp falls back to the current time.
+        let before = OffsetDateTime::now_utc();
+        let line = r#"{"type":"permission-mode","permissionMode":"plan","sessionId":"s","timestamp":"not a time"}"#;
+        let items = parse_line(line).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].timestamp >= before);
+    }
+
+    #[test]
+    fn test_datetime_from_millis_range() {
+        assert_eq!(datetime_from_millis(0), Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(datetime_from_millis(i64::MAX), None);
     }
 
     #[test]

@@ -124,12 +124,13 @@ fn list_sessions_cmd() -> Result<()> {
     }
 
     println!("Recent sessions:");
+    let hms = time::format_description::parse("[hour]:[minute]:[second]").unwrap();
     for s in sessions {
         let status = if s.is_active { "● " } else { "  " };
-        let time = s.modified.format("%H:%M:%S");
+        let clock = s.modified.format(&hms).unwrap_or_default();
         let id_display = &s.id[..s.id.len().min(12)];
         let path_display = truncate_path(&s.project_path, 30);
-        println!("  {}{}  {}  {}", status, time, id_display, path_display);
+        println!("  {}{}  {}  {}", status, clock, id_display, path_display);
     }
 
     Ok(())
