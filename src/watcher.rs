@@ -120,6 +120,69 @@ fn is_main_session_file(path: &Path) -> bool {
     true
 }
 
+/// Whether a file name is a subagent transcript (`agent-<id>.jsonl`). Workflow
+/// runs also write a `journal.jsonl` next to their agents; it is run
+/// bookkeeping and is not a transcript.
+fn is_agent_file(name: &str) -> bool {
+    name.starts_with("agent-") && name.ends_with(".jsonl")
+}
+
+/// Agent transcripts directly in `dir`, plus those in subdirectories down to
+/// `depth` more levels.
+fn agent_files_below(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return found,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth > 0 {
+                found.extend(agent_files_below(&path, depth - 1));
+            }
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_agent_file)
+        {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// The subagent transcripts of a session. Most live in
+/// `<session>/subagents/`; the agents of a workflow run live two levels
+/// deeper, in `<session>/subagents/workflows/<run>/`.
+fn subagent_files(subagent_dir: &Path) -> Vec<PathBuf> {
+    agent_files_below(subagent_dir, 2)
+}
+
+/// The agent id of an `agent-<id>.jsonl` path.
+fn agent_id_from_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .trim_start_matches("agent-")
+        .trim_end_matches(".jsonl")
+        .to_string()
+}
+
+/// The id of the session that owns a file under `<session>/subagents/`,
+/// however deeply it is nested. Empty when the path has no `/subagents/`.
+fn session_id_from_subagent_path(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    match path_str.rfind("/subagents/") {
+        Some(idx) => Path::new(&path_str[..idx])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string(),
+        None => String::new(),
+    }
+}
+
 /// Read agent type from the .meta.json file adjacent to a subagent .jsonl file
 fn read_agent_type(jsonl_path: &Path) -> String {
     let meta_path = jsonl_path.with_extension("meta.json");
@@ -437,23 +500,13 @@ impl Watcher {
             .map(|p| p.join(&id).join("subagents"))
             .unwrap_or_default();
 
-        if let Ok(entries) = fs::read_dir(&subagent_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".jsonl") {
-                        let agent_id = name
-                            .trim_start_matches("agent-")
-                            .trim_end_matches(".jsonl")
-                            .to_string();
-                        let agent_type = read_agent_type(&path);
-                        if !agent_type.is_empty() {
-                            subagent_types_map.insert(agent_id.clone(), agent_type);
-                        }
-                        subagents_map.insert(agent_id, path);
-                    }
-                }
+        for path in subagent_files(&subagent_dir) {
+            let agent_id = agent_id_from_path(&path);
+            let agent_type = read_agent_type(&path);
+            if !agent_type.is_empty() {
+                subagent_types_map.insert(agent_id.clone(), agent_type);
             }
+            subagents_map.insert(agent_id, path);
         }
 
         Ok(Session {
@@ -744,6 +797,14 @@ impl Watcher {
             None => return,
         };
 
+        // Agent transcripts in subagents/ and in the run directories under
+        // subagents/workflows/.
+        if dir_name == "subagents" || path.to_string_lossy().contains("/subagents/") {
+            for agent_file in agent_files_below(path, 2) {
+                self.handle_new_subagent_file(&agent_file).await;
+            }
+        }
+
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(_) => return,
@@ -760,9 +821,6 @@ impl Watcher {
             };
 
             match dir_name {
-                "subagents" if name.ends_with(".jsonl") => {
-                    self.handle_new_subagent_file(&entry_path).await;
-                }
                 "tool-results" if name.ends_with(".txt") => {
                     self.handle_new_tool_result_file(&entry_path).await;
                 }
@@ -815,27 +873,18 @@ impl Watcher {
 
     /// Handle discovery of a new subagent JSONL file
     async fn handle_new_subagent_file(&self, path: &Path) {
-        let path_str = path.to_string_lossy();
-        if !path_str.ends_with(".jsonl") {
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_agent_file)
+        {
             return;
         }
 
-        let agent_id = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .trim_start_matches("agent-")
-            .trim_end_matches(".jsonl")
-            .to_string();
+        let agent_id = agent_id_from_path(path);
 
-        // Walk up: .../projects/<project>/<sessionID>/subagents/agent-<id>.jsonl
-        let session_id = path
-            .parent() // subagents/
-            .and_then(|p| p.parent()) // <sessionID>/
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
+        // .../projects/<project>/<sessionID>/subagents/[workflows/<run>/]agent-<id>.jsonl
+        let session_id = session_id_from_subagent_path(path);
 
         let sessions = self.sessions.read().await;
         let session = match sessions.get(&session_id) {
@@ -1032,43 +1081,30 @@ impl Watcher {
             .map(|p| p.join(&session.id).join("subagents"))
             .unwrap_or_default();
 
-        let entries = match fs::read_dir(&subagent_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+        for path in subagent_files(&subagent_dir) {
+            let agent_id = agent_id_from_path(&path);
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".jsonl") {
-                    let agent_id = name
-                        .trim_start_matches("agent-")
-                        .trim_end_matches(".jsonl")
-                        .to_string();
-
-                    let exists = session.subagents.read().await.contains_key(&agent_id);
-                    if !exists {
-                        let agent_type = read_agent_type(&path);
-                        if !agent_type.is_empty() {
-                            session
-                                .subagent_types
-                                .write()
-                                .await
-                                .insert(agent_id.clone(), agent_type.clone());
-                        }
-                        session
-                            .subagents
-                            .write()
-                            .await
-                            .insert(agent_id.clone(), path);
-
-                        let _ = self.new_agent_tx.try_send(NewAgentMsg {
-                            session_id: session.id.clone(),
-                            agent_id,
-                            agent_type,
-                        });
-                    }
+            let exists = session.subagents.read().await.contains_key(&agent_id);
+            if !exists {
+                let agent_type = read_agent_type(&path);
+                if !agent_type.is_empty() {
+                    session
+                        .subagent_types
+                        .write()
+                        .await
+                        .insert(agent_id.clone(), agent_type.clone());
                 }
+                session
+                    .subagents
+                    .write()
+                    .await
+                    .insert(agent_id.clone(), path);
+
+                let _ = self.new_agent_tx.try_send(NewAgentMsg {
+                    session_id: session.id.clone(),
+                    agent_id,
+                    agent_type,
+                });
             }
         }
     }
@@ -1992,5 +2028,175 @@ mod tests {
             }
         }
         assert_eq!(items.len(), 5, "expected 5 items from debounced reads");
+    }
+
+    // --- workflow agents (<session>/subagents/workflows/<run>/agent-*.jsonl) ---
+
+    /// Makes a session dir holding one plain subagent and one workflow run
+    /// with an agent, its meta file and the run's journal.jsonl. Returns the
+    /// subagents dir.
+    fn write_workflow_tree(project_dir: &Path, session_id: &str) -> PathBuf {
+        let subagent_dir = project_dir.join(session_id).join("subagents");
+        let run_dir = subagent_dir.join("workflows").join("wf_1");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(subagent_dir.join("agent-plain.jsonl"), "").unwrap();
+        fs::write(
+            subagent_dir.join("agent-plain.meta.json"),
+            r#"{"agentType":"Explore"}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("agent-wf1.jsonl"), "").unwrap();
+        fs::write(
+            run_dir.join("agent-wf1.meta.json"),
+            r#"{"agentType":"workflow-subagent"}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("journal.jsonl"), "{\"type\":\"launched\"}\n").unwrap();
+        subagent_dir
+    }
+
+    #[test]
+    fn test_subagent_files_includes_workflow_agents_not_journal() {
+        let dir = TempDir::new().unwrap();
+        let subagent_dir = write_workflow_tree(dir.path(), "sess");
+
+        let mut names: Vec<String> = subagent_files(&subagent_dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["agent-plain.jsonl", "agent-wf1.jsonl"]);
+    }
+
+    #[test]
+    fn test_session_id_from_subagent_path() {
+        let cases = [
+            ("/p/-proj/sess1/subagents/agent-a.jsonl", "sess1"),
+            (
+                "/p/-proj/sess1/subagents/workflows/wf_9/agent-a.jsonl",
+                "sess1",
+            ),
+            (
+                "/p/-proj/sess1/subagents/workflows/wf_9/journal.jsonl",
+                "sess1",
+            ),
+            ("/p/-proj/sess1.jsonl", ""),
+        ];
+        for (path, want) in cases {
+            assert_eq!(
+                session_id_from_subagent_path(Path::new(path)),
+                want,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_session_and_poll_find_workflow_agents() {
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects");
+        let project_dir = projects_dir.join("-test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let session_file = project_dir.join("sess004.jsonl");
+        fs::write(&session_file, "").unwrap();
+        write_workflow_tree(&project_dir, "sess004");
+
+        let _g = claude_home_guard().await;
+        std::env::set_var("CLAUDE_HOME", dir.path());
+        let (w, mut ch) = Watcher::new(
+            Some("sess004"),
+            100,
+            Duration::from_secs(ACTIVE_WINDOW_SECS),
+            0,
+        )
+        .await
+        .unwrap();
+        std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
+
+        // Initial scan.
+        let session = w.build_session(&session_file).unwrap();
+        {
+            let agents = session.subagents.read().await;
+            assert!(agents.contains_key("wf1"), "{agents:?}");
+            assert!(agents.contains_key("plain"), "{agents:?}");
+            assert!(!agents.contains_key("journal"), "{agents:?}");
+        }
+        assert_eq!(
+            session
+                .subagent_types
+                .read()
+                .await
+                .get("wf1")
+                .map(String::as_str),
+            Some("workflow-subagent")
+        );
+
+        // Poll path, starting from a session that knows no agents.
+        let fresh = Session::new("sess004".into(), "test/project".into(), session_file);
+        w.check_for_new_subagents(&fresh).await;
+        let mut got = Vec::new();
+        while let Ok(msg) = ch.new_agent.try_recv() {
+            got.push((msg.agent_id, msg.agent_type));
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("plain".to_string(), "Explore".to_string()),
+                ("wf1".to_string(), "workflow-subagent".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notify_new_workflow_agent_discovery() {
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects");
+        let project_dir = projects_dir.join("-test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("sess003.jsonl"), "").unwrap();
+        let subagent_dir = project_dir.join("sess003").join("subagents");
+        fs::create_dir_all(&subagent_dir).unwrap();
+
+        let _g = claude_home_guard().await;
+        std::env::set_var("CLAUDE_HOME", dir.path());
+        let (w, mut ch) = Watcher::new(
+            Some("sess003"),
+            100,
+            Duration::from_secs(ACTIVE_WINDOW_SECS),
+            0,
+        )
+        .await
+        .unwrap();
+        std::env::remove_var("CLAUDE_HOME");
+        drop(_g);
+
+        let w = Arc::new(w);
+        w.clone().start();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The run directory, its journal and its agent appear after the watch starts.
+        let run_dir = subagent_dir.join("workflows").join("wf_2");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("journal.jsonl"), "{\"type\":\"launched\"}\n").unwrap();
+        fs::write(
+            run_dir.join("agent-wfx.meta.json"),
+            r#"{"agentType":"workflow-subagent"}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("agent-wfx.jsonl"), "").unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(10), ch.new_agent.recv())
+            .await
+            .expect("timed out waiting for workflow agent discovery")
+            .unwrap();
+        assert_eq!(msg.session_id, "sess003");
+        assert_eq!(msg.agent_id, "wfx");
+        assert_eq!(msg.agent_type, "workflow-subagent");
+
+        // Nothing else (the journal) is announced as an agent.
+        let extra = tokio::time::timeout(Duration::from_millis(500), ch.new_agent.recv()).await;
+        assert!(extra.is_err(), "unexpected extra agent: {extra:?}");
     }
 }

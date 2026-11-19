@@ -1510,7 +1510,67 @@ fn extract_tool_result_content(content: Option<&Value>) -> String {
     }
 }
 
+/// The name in a workflow script's `export const meta = { name: '...', ... }`
+/// header.
+fn workflow_meta_name(script: &str) -> Option<&str> {
+    let mut rest = script;
+    while let Some(i) = rest.find("meta") {
+        rest = &rest[i + 4..];
+        let Some(body) = rest
+            .trim_start()
+            .strip_prefix('=')
+            .and_then(|s| s.trim_start().strip_prefix('{'))
+        else {
+            continue;
+        };
+        let header = &body[..body.find('}').unwrap_or(body.len())];
+        let mut from = 0;
+        while let Some(j) = header[from..].find("name:") {
+            let at = from + j;
+            from = at + 5;
+            let word_boundary = header[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            if !word_boundary {
+                continue;
+            }
+            let value = header[from..].trim_start();
+            if let Some(quoted) = value.strip_prefix(['\'', '"']) {
+                if let Some(end) = quoted.find(['\'', '"']) {
+                    if end > 0 {
+                        return Some(&quoted[..end]);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Summarise a Workflow call. The call carries the whole script (several KB)
+/// and free-form args, so it is read apart from `ToolInput` and shown as the
+/// workflow's name or its script file.
+fn format_workflow_input(input: &Value) -> String {
+    let field = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    if !field("name").is_empty() {
+        field("name").to_string()
+    } else if !field("scriptPath").is_empty() {
+        field("scriptPath").to_string()
+    } else if !field("script").is_empty() {
+        match workflow_meta_name(field("script")) {
+            Some(name) => name.to_string(),
+            None => format!("inline script ({} bytes)", field("script").len()),
+        }
+    } else {
+        input.to_string()
+    }
+}
+
 fn format_tool_input(tool_name: &str, input: &Value) -> String {
+    if tool_name == "Workflow" {
+        return format_workflow_input(input);
+    }
     let input: ToolInput = serde_json::from_value(input.clone()).unwrap_or_default();
 
     match tool_name {
@@ -2598,6 +2658,34 @@ mod tests {
             ),
             "Picker needs a mouse"
         );
+        assert_eq!(
+            fmt(
+                "Workflow",
+                r#"{"script":"export const meta = {\n  name: 'research-bc-races',\n  description: 'x',\n  phases: [{ title: 'Research' }],\n}\nconst r = await agent('go')"}"#
+            ),
+            "research-bc-races"
+        );
+        assert_eq!(
+            fmt("Workflow", r#"{"script":"const r = await agent('go')"}"#),
+            "inline script (27 bytes)"
+        );
+        assert_eq!(
+            fmt("Workflow", r#"{"name":"review-changes","args":{"pr":7}}"#),
+            "review-changes"
+        );
+        assert_eq!(
+            fmt("Workflow", r#"{"scriptPath":"/tmp/wf.js"}"#),
+            "/tmp/wf.js"
+        );
+        assert_eq!(fmt("Workflow", r#"{}"#), "{}");
+        // A key that merely ends in "name" is not the workflow name.
+        assert_eq!(
+            fmt(
+                "Workflow",
+                r#"{"script":"export const meta = { rename: 'a', name: \"b\" }"}"#
+            ),
+            "b"
+        );
     }
 
     #[test]
@@ -2716,6 +2804,36 @@ mod tests {
             r#"{"type":"last-prompt","sessionId":"s"}"#,
             r#"{"type":"file-history-snapshot","sessionId":"s"}"#,
             r#"{"type":"file-history-delta","sessionId":"s"}"#,
+        ];
+        for line in lines {
+            assert!(parse_line(line).unwrap().is_empty(), "{line}");
+        }
+    }
+
+    /// Attachments that echo file contents, IDE state and carried-over
+    /// schedules, plus the account and tool-name lines and the workflow
+    /// journal, are deliberately left dropped. The watcher does not read the
+    /// workflow journal (started / result / launched); the lines are listed
+    /// here in case a session file ever contains them.
+    #[test]
+    fn test_parse_v015_dropped() {
+        let _g = debug_all_lock();
+        let lines = [
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"file","filename":"/x/build.zig","content":{"type":"text","file":{"filePath":"/x/build.zig","content":"const std = @import(\"std\");"}}}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"compact_file_reference","filename":"/x/README.md","displayPath":"../x/README.md"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"selected_lines_in_ide","ideName":"Visual Studio Code","lineStart":54,"lineEnd":54,"filename":"/x/players.rs","content":"..","displayPath":"src/players.rs"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"invoked_skills","skills":[{"name":"p:pr","path":"plugin:p:pr","content":"Use this template"}]}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"directory","path":"/x","content":"Cargo.toml\nsrc","displayPath":"../x"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"task_reminder","content":[],"itemCount":0}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"session_cron_carry","tasks":[],"wakeup":{"prompt":"continue","scheduledFor":1794318240000,"reason":"waiting"}}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"edited_text_file","filename":"/x/a.go","snippet":"1\tpackage x"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"credential_org"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-11-01T10:00:00Z","sessionId":"s","attachment":{"type":"command_permissions","allowedTools":["Bash"]}}"#,
+            r#"{"type":"session-owner","accountUuid":"a","organizationUuid":"o","sessionId":"s"}"#,
+            r#"{"type":"tools-used","tools":["Bash","Read"],"sessionId":"s"}"#,
+            r#"{"type":"started","key":"v2:ea2e","agentId":"afce7224","label":"race-7","phase":"Research and write"}"#,
+            r#"{"type":"result","key":"v2:ea2e","agentId":"afce7224","result":"File written."}"#,
+            r#"{"type":"launched"}"#,
         ];
         for line in lines {
             assert!(parse_line(line).unwrap().is_empty(), "{line}");
