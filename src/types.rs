@@ -1,7 +1,7 @@
-use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 /// How many chars of agent ID to show in display name
@@ -54,7 +54,7 @@ pub struct StreamItem {
     pub session_id: String,
     pub agent_id: String,
     pub agent_name: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: OffsetDateTime,
     pub content: String,
     pub tool_name: Option<String>,
     pub tool_id: Option<String>,
@@ -112,7 +112,7 @@ pub struct SessionInfo {
     pub id: String,
     pub path: PathBuf,
     pub project_path: String,
-    pub modified: DateTime<Utc>,
+    pub modified: OffsetDateTime,
     pub is_active: bool,
 }
 
@@ -156,5 +156,5 @@ pub struct ActivityInfo {
     pub agent_id: String,
     pub is_active: bool,
     /// Last file modification time — drives auto-collapse policy.
-    pub last_modified: DateTime<Utc>,
+    pub last_modified: OffsetDateTime,
 }

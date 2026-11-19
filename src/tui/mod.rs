@@ -327,7 +327,7 @@ impl App {
                             &node.parent_agent_id[..node.parent_agent_id.len().min(7)]
                         )
                     },
-                    timestamp: chrono::Utc::now(),
+                    timestamp: time::OffsetDateTime::now_utc(),
                     content,
                     tool_name: Some(format!("{} {}", status_icon, node.name)),
                     tool_id: Some(node.id.clone()),
@@ -453,7 +453,7 @@ impl App {
     ) {
         use std::collections::HashMap;
         // Newest LastModified across main + all agents per session.
-        let mut latest: HashMap<&str, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        let mut latest: HashMap<&str, time::OffsetDateTime> = HashMap::new();
         for info in activity {
             let entry = latest
                 .entry(info.session_id.as_str())
@@ -463,9 +463,9 @@ impl App {
             }
         }
 
-        let now = chrono::Utc::now();
-        let awake_window = chrono::Duration::from_std(Duration::from_secs(30)).unwrap();
-        let threshold_chrono = chrono::Duration::from_std(threshold).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let awake_window = time::Duration::seconds(30);
+        let threshold_age = time::Duration::try_from(threshold).unwrap_or(time::Duration::MAX);
 
         // Snapshot session state (id, collapsed, pinned, age) without holding
         // a mutable borrow across the decide→apply step.
@@ -479,7 +479,7 @@ impl App {
                 let age = now - *last;
                 let awake = age < awake_window;
                 Some((node.id.clone(), node.collapsed, node.pinned)).map(|(id, c, p)| {
-                    let should_collapse = !c && !p && !awake && age >= threshold_chrono;
+                    let should_collapse = !c && !p && !awake && age >= threshold_age;
                     let should_unpin = p && awake;
                     (id, should_collapse, should_unpin)
                 })
